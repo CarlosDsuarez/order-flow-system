@@ -1,0 +1,154 @@
+{
+  "date_utc": "2026-09-02 19:40:59Z",
+  "hostname": "Carloair.local",
+  "machine_context": "red de investigación doméstica, no colocación",
+  "symbol": "BTCUSDT",
+  "streams": [
+    "btcusdt@depth@100ms",
+    "btcusdt@trade"
+  ],
+  "n_depth_requested": 10000,
+  "n_depth": 10000,
+  "n_trade": 36092,
+  "duration_s": 1221.6996480420057,
+  "reconnects": 3,
+  "sequence_gaps": 0,
+  "decode_errors": 0,
+  "gap_threshold_ms": 250.0,
+  "clock_offset": {
+    "n": 15.0,
+    "mean_ns": -196678200.0,
+    "min_ns": -341132000.0,
+    "p50_ns": -241940000.0,
+    "p90_ns": -88195200.00000004,
+    "p99_ns": 348580839.99999976,
+    "p99_9_ns": 404146084.0000003,
+    "max_ns": 410320000.0,
+    "mean_rtt_ns": 395332266.6666667,
+    "max_rtt_ns": 932400000.0,
+    "mean_midpoint_offset_ns": -394344333.3333333
+  },
+  "clock_offset_formula": "offset_ns = local_after_ns - serverTime_ns (local - server)",
+  "mean_offset_ns": -196678200.0,
+  "depth_raw": {
+    "n": 10000.0,
+    "min": -358101000.0,
+    "p50": -305420500.0,
+    "p90": -112512499.99999997,
+    "p99": 585864360.0000012,
+    "p99_9": 3750542848.000021,
+    "max": 4646970000.0,
+    "mean": -234285460.8
+  },
+  "depth_adjusted": {
+    "n": 10000.0,
+    "min": -161422800.0,
+    "p50": -108742300.0,
+    "p90": 84165700.00000003,
+    "p99": 782542560.0000012,
+    "p99_9": 3947221048.0000205,
+    "max": 4843648200.0,
+    "mean": -37607260.8
+  },
+  "trade_raw": {
+    "n": 36092.0,
+    "min": -357712000.0,
+    "p50": -280252500.0,
+    "p90": 34982000.000000015,
+    "p99": 3387808540.0,
+    "p99_9": 4430166363.0,
+    "max": 4542026000.0,
+    "mean": -122662693.17300233
+  },
+  "trade_adjusted": {
+    "n": 36092.0,
+    "min": -161033800.0,
+    "p50": -83574300.0,
+    "p90": 231660200.00000003,
+    "p99": 3584486740.0,
+    "p99_9": 4626844563.0,
+    "max": 4738704200.0,
+    "mean": 74015506.82699767
+  },
+  "depth_interarrival_exchange": {
+    "n": 9999.0,
+    "min": 102000000.0,
+    "p50": 102000000.0,
+    "p90": 102000000.0,
+    "p99": 102000000.0,
+    "p99_9": 104000000.0,
+    "max": 106000000.0,
+    "mean": 102003000.30003001
+  },
+  "depth_interarrival_local": {
+    "n": 9999.0,
+    "min": 6000.0,
+    "p50": 99106459.0,
+    "p90": 179741041.2,
+    "p99": 420706294.3400007,
+    "p99_9": 1023517029.5840075,
+    "max": 4716545375.0,
+    "mean": 102001706.37473747
+  },
+  "depth_gaps_exchange": 0,
+  "depth_gaps_local": 589,
+  "institutional_benchmarks": [
+    {
+      "source": "Databento (marketing cuantitativo)",
+      "figure": "p90 42 µs (cross-connect) / 590 µs (internet) hasta la aplicación; mediana 6.1 µs handoff→envío en el gateway",
+      "notes": "Cifras de producto, no un SLA de Binance. Orden de magnitud colo vs internet.",
+      "url": "https://databento.com/live",
+      "retrieved": "2026-09-02"
+    },
+    {
+      "source": "Databento dedicated connectivity (marketing)",
+      "figure": "p90 42.4 µs cross-connect 10G/25G; internet 0.5+ ms; interconnect cloud 1.7+ ms",
+      "notes": "Tabla de arquitectura propia. Marketing, pero con números explícitos.",
+      "url": "https://databento.com/docs/architecture/dedicated-connectivity-guide",
+      "retrieved": "2026-09-02"
+    },
+    {
+      "source": "Nanoconda — CME MDP3 vs iLink (empírico colocated)",
+      "figure": "MD latency mediana 265.7 µs; MSGW 203.1 µs (exchange sending time - transaction time)",
+      "notes": "Medición con timestamps CME, no reloj local. Colo Aurora, no retail.",
+      "url": "https://nanoconda.com/blog/cme-trade-summary-vs-private-fills/",
+      "retrieved": "2026-09-02"
+    },
+    {
+      "source": "Rithmic R|API suite (marketing de vendor)",
+      "figure": "Diamond API tick-to-trade típico <250 µs (colo); R|API+ / Protocol <1 ms",
+      "notes": "Especificación comercial. No es Binance. CQG no publica µs comparables.",
+      "url": "https://www.rithmic.com/products/api-suite",
+      "retrieved": "2026-09-02"
+    },
+    {
+      "source": "CQG Client APIs (marketing)",
+      "figure": "«the CQG API introduces only one millisecond for data round-trip»",
+      "notes": "Folleto, no hop de matching engine. Sin spec pública en µs.",
+      "url": "https://www.cqg.com/products/cqg-apis/client-apis",
+      "retrieved": "2026-09-02"
+    },
+    {
+      "source": "Binance USD-M Diff. Book Depth (oficial)",
+      "figure": "Update speed 250 ms / 500 ms / 100 ms (`@depth@100ms`)",
+      "notes": "El libro que alimenta OFI ya está discretizado a 100 ms. Eso puede dominar cualquier last-mile de unos pocos ms.",
+      "url": "https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Diff-Book-Depth-Streams",
+      "retrieved": "2026-09-02"
+    },
+    {
+      "source": "Binance Developer Community (anecdótico, no SLA)",
+      "figure": "WS API USD-M RTT ~6 ms vs Spot ~1.6 ms (un usuario, 2024-07)",
+      "notes": "Hilo de foro. Infra de proximidad, no hogar. No generalizar.",
+      "url": "https://dev.binance.vision/t/usd-m-futures-high-websocket-api-latency/21511",
+      "retrieved": "2026-09-02"
+    },
+    {
+      "source": "Jane Street engineering blog (orden de magnitud)",
+      "figure": "Sistemas de trading que responden en «far less than» 250 µs (el intervalo de un profiler muestral)",
+      "notes": "No es un SLA. Sitúa el tick-to-trade colo en cientos de µs o menos.",
+      "url": "https://blog.janestreet.com/magic-trace/",
+      "retrieved": "2026-09-02"
+    }
+  ],
+  "duration_ns": 1221699648042
+}

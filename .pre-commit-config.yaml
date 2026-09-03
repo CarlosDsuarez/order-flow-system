@@ -1,0 +1,37 @@
+# Run `uv run pre-commit install` once, then hooks run on every commit.
+# Run everything manually with `uv run pre-commit run --all-files`.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.12.9
+    hooks:
+      - id: uv-lock
+
+  # mypy runs inside the project's own environment so it sees the installed
+  # packages and stub packages (pandas-stubs, sortedcontainers-stubs, ...).
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        args: [src, tests, scripts]
+        types_or: [python, pyi, toml]

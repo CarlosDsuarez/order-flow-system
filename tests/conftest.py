@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
@@ -11,6 +12,53 @@ import pytest
 
 if TYPE_CHECKING:
     import numpy.typing as npt
+
+
+def is_full_suite_args(args: list[str]) -> bool:
+    """True when pytest was invoked without a subset path.
+
+    ``--cov-fail-under=80`` is only meaningful on the whole package. Running one
+    live file (or any other subset) covers a slice of ``order_flow`` and would
+    otherwise fail after the test itself passed.
+    """
+    paths = [arg for arg in args if arg and not arg.startswith("-")]
+    if not paths:
+        return True
+    return all(Path(path).name == "tests" for path in paths)
+
+
+def _disable_coverage(namespace: object, plugin: object | None) -> None:
+    """Subset runs must not print a 20% report or overwrite coverage.xml."""
+    namespace.no_cov = True  # type: ignore[attr-defined]
+    namespace.cov_fail_under = 0  # type: ignore[attr-defined]
+    if plugin is None:
+        return
+    plugin.options.no_cov = True  # type: ignore[attr-defined]
+    plugin.options.cov_fail_under = 0  # type: ignore[attr-defined]
+    plugin._disabled = True  # type: ignore[attr-defined]
+
+
+def pytest_load_initial_conftests(
+    early_config: pytest.Config,
+    args: list[str],
+) -> None:
+    """pytest-cov registers during this hook; disable it for subset paths."""
+    if is_full_suite_args([str(arg) for arg in args]):
+        return
+    _disable_coverage(
+        early_config.known_args_namespace,
+        early_config.pluginmanager.getplugin("_cov"),
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_configure(config: pytest.Config) -> None:
+    """Disable coverage when pytest was given a file/dir subset."""
+    invocation = [str(arg) for arg in config.invocation_params.args]
+    collected = [str(arg) for arg in config.args]
+    if is_full_suite_args(invocation) and is_full_suite_args(collected):
+        return
+    _disable_coverage(config.option, config.pluginmanager.getplugin("_cov"))
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

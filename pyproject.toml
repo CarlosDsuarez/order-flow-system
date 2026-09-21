@@ -132,6 +132,7 @@ ignore = [
 "src/order_flow/backtest/hft_runner.py" = ["PLC0415", "PLR0915", "ANN401"]
 "tests/unit/test_nautilus_engine.py" = ["PLC0415"]
 "tests/unit/test_nautilus_factory.py" = ["ANN401"]
+"tests/unit/test_live_report.py" = ["ANN401"]
 "tests/unit/test_hft_engine.py" = ["PLC0415"]
 
 [tool.ruff.lint.isort]

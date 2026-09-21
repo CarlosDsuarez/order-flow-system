@@ -29,6 +29,70 @@ class ReconstructionError(Exception):
     """Capture is missing a snapshot at or before ``T``, or replay hit a sequence gap."""
 
 
+@dataclass(frozen=True, slots=True)
+class AlignedBook:
+    """Book rebuilt at the first stored delta with ``u >= rest_id``.
+
+    ``batches_replayed`` counts applied stored deltas (0 when a snapshot sits
+    exactly on ``rest_id``). Compare with :func:`sync.compare_top_levels`.
+    """
+
+    book: OrderBook
+    aligned_u: int
+    batches_replayed: int
+
+
+def reconstruct_book_at_update_id(
+    root: Path,
+    rest_id: int,
+    *,
+    exchange: str,
+    symbol: str,
+) -> AlignedBook:
+    """Return the tape state at the first stored ``u >= rest_id`` (inclusive).
+
+    Snapshot: latest stored with ``last_update_id <= rest_id``. Then stored
+    deltas with ``final_update_id`` in ``(snap_id, ...]`` in ``final_update_id``
+    order until the first ``u >= rest_id`` (Futures bracketing via
+    :meth:`OrderBook.apply_delta`).
+
+    Raises:
+        ReconstructionError: If no snapshot exists at or before ``rest_id``,
+            the stored chain ends before ``rest_id``, or replay hits a
+            sequence gap (e.g. a resync hole: align is impossible, not a mismatch).
+    """
+    snapshots = read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)
+    eligible = snapshots.filter(pl.col("last_update_id") <= rest_id)
+    if eligible.height == 0:
+        msg = f"no snapshot with last_update_id <= {rest_id} for {exchange}:{symbol}"
+        raise ReconstructionError(msg)
+    chosen = eligible.sort(["last_update_id", "ts_event_ns"]).tail(1)
+    snapshot = snapshots_from_frame(chosen)[0]
+    if snapshot.last_update_id == rest_id:
+        book = OrderBook()
+        book.apply_snapshot(snapshot)
+        return AlignedBook(book=book, aligned_u=rest_id, batches_replayed=0)
+
+    deltas = read_events(root, "book_delta", exchange=exchange, symbol=symbol)
+    subsequent = deltas.filter(pl.col("final_update_id") > snapshot.last_update_id).sort(
+        "final_update_id"
+    )
+    book = OrderBook()
+    book.apply_snapshot(snapshot)
+    for batches, delta in enumerate(deltas_from_frame(subsequent), start=1):
+        try:
+            book.apply_delta(delta)
+        except SequenceGapError as exc:
+            msg = (
+                f"sequence gap while replaying delta u={delta.final_update_id} towards R={rest_id}"
+            )
+            raise ReconstructionError(msg) from exc
+        if delta.final_update_id >= rest_id:
+            return AlignedBook(book=book, aligned_u=delta.final_update_id, batches_replayed=batches)
+    msg = f"stored chain ends at u={book.last_update_id}, before R={rest_id}"
+    raise ReconstructionError(msg)
+
+
 def reconstruct_book(
     root: Path,
     ts_ns: int,

@@ -9,8 +9,20 @@ from pathlib import Path
 import pytest
 
 import order_flow
+from tests.conftest import is_full_suite_args
 
 SUBPACKAGES = ("ingestion", "orderbook", "storage", "metrics", "backtest", "utils")
+
+
+def test_full_suite_args_empty_and_tests_dir() -> None:
+    assert is_full_suite_args([]) is True
+    assert is_full_suite_args(["tests"]) is True
+    assert is_full_suite_args(["/Users/me/proj/tests"]) is True
+
+
+def test_full_suite_args_rejects_single_file() -> None:
+    assert is_full_suite_args(["tests/integration/test_binance_live_l2.py"]) is False
+    assert is_full_suite_args(["tests/unit/test_ofi.py"]) is False
 
 
 def test_version() -> None:

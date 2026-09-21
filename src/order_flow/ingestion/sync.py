@@ -22,7 +22,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from order_flow.orderbook.book import OrderBook
 from order_flow.orderbook.errors import SequenceGapError
@@ -36,6 +36,10 @@ BACKOFF_FACTOR: float = 2.0
 JITTER_FRAC: float = 0.25
 DEFAULT_MAX_BUFFER: int = 5_000
 QTY_MATCH_TOL: float = 1e-9
+#: Cap del detalle por mismatch en :class:`HonestyReport` (pedido del reporte).
+MAX_MISMATCH_DETAILS: int = 20
+
+SideLabel = Literal["bid", "ask"]
 
 
 class UniformRng(Protocol):
@@ -115,6 +119,22 @@ class DepthDecision(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class LevelMismatch:
+    """Un nivel top-N que discrepa entre libro local y snapshot REST.
+
+    ``qty_local`` es ``None`` cuando el precio no existe en el libro local
+    (nivel ausente o removido por un delta con ``qty == 0``); entonces
+    ``abs_diff`` es la cantidad REST completa.
+    """
+
+    side: SideLabel
+    price: float
+    qty_local: float | None
+    qty_rest: float
+    abs_diff: float
+
+
+@dataclass(frozen=True, slots=True)
 class HonestyReport:
     """Top-N comparison of a local book against a REST snapshot (no venue checksum)."""
 
@@ -123,6 +143,16 @@ class HonestyReport:
     max_qty_discrepancy: float
     last_update_id_local: int | None
     last_update_id_rest: int
+    last_update_id_aligned: int | None = None
+    delta_ids: int | None = None
+    stale: bool = False
+    mismatch_details: tuple[LevelMismatch, ...] = ()
+    batches_replayed: int = 0
+
+    @property
+    def overshoot(self) -> int | None:
+        """Alias de :attr:`delta_ids` (``alineado - REST``); compat con reportes previos."""
+        return self.delta_ids
 
     @property
     def matches(self) -> int:
@@ -244,13 +274,29 @@ def reconnect_delay(
     return min(base + jitter, cap)
 
 
-def compare_top_levels(book: OrderBook, rest: BookSnapshot, *, levels: int = 20) -> HonestyReport:
+def compare_top_levels(
+    book: OrderBook,
+    rest: BookSnapshot,
+    *,
+    levels: int = 20,
+    last_update_id_aligned: int | None = None,
+    delta_ids: int | None = None,
+    overshoot: int | None = None,
+    stale: bool = False,
+    batches_replayed: int = 0,
+) -> HonestyReport:
     """Compare local top-``levels`` quantities against a REST snapshot, keyed by price.
 
     Binance USD-M Futures does not expose a depth checksum. This is the honesty
     substitute: REST top-N is the reference; a missing local price counts as a
     mismatch with discrepancy equal to the REST quantity.
+
+    ``delta_ids`` es ``alineado - REST`` (≈0 cuando hay alineación real).
+    ``overshoot`` se mantiene como alias deprecado (si solo viene ese, se usa).
+    El detalle por mismatch se recorta a ``MAX_MISMATCH_DETAILS`` (bids primero).
     """
+    if delta_ids is None:
+        delta_ids = overshoot
     local_bids, local_asks = book.depth(levels)
     rest_book = OrderBook()
     rest_book.apply_snapshot(rest)
@@ -259,34 +305,68 @@ def compare_top_levels(book: OrderBook, rest: BookSnapshot, *, levels: int = 20)
     compared = 0
     mismatches = 0
     max_disc = 0.0
-    for local_side, rest_side in ((local_bids, rest_bids), (local_asks, rest_asks)):
-        side_compared, side_mismatches, side_disc = _compare_side(local_side, rest_side)
+    details: list[LevelMismatch] = []
+    sides: tuple[tuple[list[PriceLevel], list[PriceLevel], SideLabel], ...] = (
+        (local_bids, rest_bids, "bid"),
+        (local_asks, rest_asks, "ask"),
+    )
+    for local_side, rest_side, side in sides:
+        side_compared, side_mismatches, side_disc, side_details = _compare_side(
+            local_side, rest_side, side=side
+        )
         compared += side_compared
         mismatches += side_mismatches
         max_disc = max(max_disc, side_disc)
+        details.extend(side_details)
     return HonestyReport(
         compared=compared,
         mismatches=mismatches,
         max_qty_discrepancy=max_disc,
         last_update_id_local=book.last_update_id,
         last_update_id_rest=rest.last_update_id,
+        last_update_id_aligned=last_update_id_aligned,
+        delta_ids=delta_ids,
+        stale=stale,
+        mismatch_details=tuple(details[:MAX_MISMATCH_DETAILS]),
+        batches_replayed=batches_replayed,
     )
 
 
-def _compare_side(local: list[PriceLevel], rest: list[PriceLevel]) -> tuple[int, int, float]:
+def _compare_side(
+    local: list[PriceLevel], rest: list[PriceLevel], *, side: SideLabel
+) -> tuple[int, int, float, list[LevelMismatch]]:
     local_qty = {level.price: level.qty for level in local}
     compared = 0
     mismatches = 0
     max_disc = 0.0
+    details: list[LevelMismatch] = []
     for level in rest:
         compared += 1
         local_q = local_qty.get(level.price)
         if local_q is None:
             mismatches += 1
             max_disc = max(max_disc, level.qty)
+            details.append(
+                LevelMismatch(
+                    side=side,
+                    price=level.price,
+                    qty_local=None,
+                    qty_rest=level.qty,
+                    abs_diff=level.qty,
+                )
+            )
             continue
         disc = abs(local_q - level.qty)
         max_disc = max(max_disc, disc)
         if disc > QTY_MATCH_TOL:
             mismatches += 1
-    return compared, mismatches, max_disc
+            details.append(
+                LevelMismatch(
+                    side=side,
+                    price=level.price,
+                    qty_local=local_q,
+                    qty_rest=level.qty,
+                    abs_diff=disc,
+                )
+            )
+    return compared, mismatches, max_disc, details

@@ -144,6 +144,59 @@ await feed.stop()
 - Tras un corte de socket, `on_disconnect()` tira el buffer y **siempre** se pide snapshot nuevo.
 - Reconnect: 0.5s, 1s, 2s, … cap 30s, con jitter.
 
+## Honesty congelada y contadores
+
+La comparación REST (`live._honesty_snapshot`) congela la mutación del libro
+(`freeze_for_honesty`): el pump WS sigue recibiendo y bufferiza deltas, pero no
+se toca libro, validador ni stats. Los deltas bufferizados se re-juegan sobre
+una **copia** hasta el primer `u >= rest.lastUpdateId` y se compara esa copia;
+el reporte incluye `last_update_id_aligned`, `overshoot = alineado - REST` y
+`stale` (REST más viejo que el freeze, timeout o gap en el replay →
+no concluyente, no es mismatch).
+
+Contadores del reporte: `deltas_applied` = mutaciones aplicadas al libro;
+`events_seen.deltas` = eventos entregados por la cola al consumidor. Como el
+consumidor ya salió del timeout cuando corre honesty y el freeze congela los
+stats, ambos son comparables (una diferencia grande indica descarte o bug, no
+la ventana de honesty).
+
+Opción de alineación elegida: **(c) + clon — pausar `apply` ANTES del GET y
+comparar una copia**. Está prohibido comparar el libro "caliente" que ya se
+adelantó y llamar "carrera residual esperada" a un 10/40: con alineación real
+`delta_ids = alineado − REST` debe ser ~0 (overshoot de un solo batch como
+máximo) y cada mismatch se reporta con `(side, price, qty_local, qty_rest,
+abs_diff)`, cap 20. Un `stale`/timeout/gap en el replay es no concluyente,
+nunca un mismatch.
+
+## Honesty check
+
+Algoritmo (`live._honesty_snapshot`, opción (c) + clon):
+
+1. Durante el run el feed aplica normal (protocolo `U/u/pu` sin cambios).
+2. Al terminar la ventana se **pausa** la aplicación al libro de honesty
+   (`freeze_for_honesty`); la cola WS sigue llenándose y los deltas se
+   bufferizan; se clona el libro en `L0`.
+3. `GET /fapi/v1/depth` con el mismo `limit` del feed → `R`.
+4. Si `L0 >= R.lastUpdateId` tras un reintento → `stale` (REST viejo; el libro
+   no puede retroceder). Si no, se aplican **solo** los diffs bufferizados
+   sobre la copia hasta el primer `u >= R.lastUpdateId` (regla Futures).
+   Timeout (`CATCH_UP_TIMEOUT_S`) o gap en el replay → error explícito
+   (`stale=True`), nunca un compare a medias.
+5. `compare_top_levels` sobre copia alineada vs `R`: `batches_replayed`
+   (holgura ≤ 1 batch: el primer `u >= R` overshotea < 1 batch), `delta_ids`,
+   mismatches y detalle por nivel (cap 20).
+
+Contrato del test en vivo (`test_binance_live_l2.py`): FAIL si libro cruzado,
+`book_synced` falso, `gaps != resyncs`, `stale`, `delta_ids < 0`,
+`batches_replayed > 1`, `mismatches/compared > 0.10` o
+`max_qty_discrepancy > 0.5` BTC. La conclusión del markdown usa veredictos
+literales (`ERROR/INCONCLUSIVE/FAIL/PASS`).
+
+Qué **NO** prueba: no es un checksum del venue (Binance USD-M no lo publica);
+es un solo punto top-N (no todo el libro); vale para la red de la máquina
+(no es SLA); no cubre trades; no detecta reordenamientos intra-batch ni
+divergencia fuera del top-N.
+
 ## Cómo correr la validación en vivo
 
 ```bash

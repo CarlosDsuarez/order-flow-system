@@ -132,6 +132,7 @@ ignore = [
 "src/order_flow/backtest/hft_runner.py" = ["PLC0415", "PLR0915", "ANN401"]
 "tests/unit/test_nautilus_engine.py" = ["PLC0415"]
 "tests/unit/test_nautilus_factory.py" = ["ANN401"]
+"tests/unit/test_live_report.py" = ["ANN401"]
 "tests/unit/test_hft_engine.py" = ["PLC0415"]
 
 [tool.ruff.lint.isort]
@@ -170,7 +171,7 @@ ignore_missing_imports = true
 # --------------------------------------------------------------------------- pytest
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --strict-config --cov=order_flow --cov-branch --cov-report=term-missing --cov-report=xml"
+addopts = "-ra --strict-markers --strict-config --cov=order_flow --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=80"
 markers = [
   "integration: requires network or external services (skipped unless RUN_INTEGRATION=1)",
   "nautilus: needs nautilus_trader (uv sync --extra backtest, or RUN_NAUTILUS=1)",
@@ -192,7 +193,6 @@ omit = [
 ]
 
 [tool.coverage.report]
-fail_under = 80
 show_missing = true
 exclude_also = [
   "if TYPE_CHECKING:",

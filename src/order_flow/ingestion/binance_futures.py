@@ -372,11 +372,62 @@ class BinanceFuturesFeed:
         self._stopped = False
         self._task: asyncio.Task[None] | None = None
         self._events_since_latency_log = 0
+        # Honesty freeze (live.py alineación por lastUpdateId): cuando está activo,
+        # ``_handle_depth`` no muta libro/validador/stats y bufferiza el delta
+        # parseado para el replay sobre la copia. El pump WS sigue encolando.
+        self._honesty_freeze = False
+        self._frozen_deltas: deque[BookDelta] = deque()
 
     @property
     def book(self) -> OrderBook:
         """Live reconstructed book. Owned by the feed; do not mutate it."""
         return self._book
+
+    @property
+    def honesty_frozen(self) -> bool:
+        """``True`` mientras ``live._honesty_snapshot`` congela la mutación."""
+        return self._honesty_freeze
+
+    def freeze_for_honesty(self) -> None:
+        """Congela la mutación del libro vivo y empieza a bufferizar deltas.
+
+        El pump WS sigue recibiendo; ``_handle_depth`` parsea cada delta pero
+        lo guarda en ``_frozen_deltas`` sin tocar libro, validador ni stats.
+        """
+        self._honesty_freeze = True
+        self._frozen_deltas.clear()
+
+    def unfreeze_for_honesty(self) -> list[BookDelta]:
+        """Reanuda la mutación y devuelve los deltas bufferizados durante el freeze."""
+        self._honesty_freeze = False
+        buffered = list(self._frozen_deltas)
+        self._frozen_deltas.clear()
+        return buffered
+
+    def drain_frozen_deltas(self) -> list[BookDelta]:
+        """Extrae (destructivamente) los deltas acumulados durante el freeze.
+
+        ``live._honesty_snapshot`` los re-juega sobre una copia del libro hasta
+        alcanzar ``rest.lastUpdateId``. El libro vivo no los ve: el helper de
+        validación detiene el feed justo después de honesty, así que esa ventana
+        se descarta (los contadores quedan congelados, ver ``run_live_validation``).
+        Si el feed siguiera vivo tras honesty, el llamante debería re-aplicar
+        la lista devuelta por :meth:`unfreeze_for_honesty`.
+        """
+        drained = list(self._frozen_deltas)
+        self._frozen_deltas.clear()
+        return drained
+
+    def copy_book(self) -> OrderBook:
+        """Copia punto-en-tiempo del libro vivo (para el replay alineado)."""
+        snapshot = self._book.snapshot()
+        copy = OrderBook(exchange=self._book.exchange, symbol=self._book.symbol)
+        copy.apply_snapshot(snapshot)
+        # Preservar el estado de secuencia: la copia ya está en L0 con los
+        # mismos flags que el vivo para que el replay sea contiguo (pu == L0).
+        copy._seq_ready = self._book._seq_ready
+        copy._is_synced = self._book._is_synced
+        return copy
 
     @property
     def stream_url(self) -> str:
@@ -614,6 +665,14 @@ class BinanceFuturesFeed:
         except (ValueError, KeyError, TypeError) as exc:
             log.warning("depth_parse_error", symbol=self.symbol, error=str(exc))
             return None
+        if self._honesty_freeze:
+            # Mundo parado para honesty: bufferizar sin mutar libro/validador/stats.
+            self._frozen_deltas.append(delta)
+            return None
+        return self._apply_synced_delta(delta)
+
+    def _apply_synced_delta(self, delta: BookDelta) -> MarketEvent | Literal["gap"] | None:
+        """Decide + aplica un delta al libro vivo (fuera del freeze de honesty)."""
         decision = self._sync.decide(delta)
         if decision is DepthDecision.BUFFER or decision is DepthDecision.DROP_STALE:
             return None
@@ -648,6 +707,10 @@ class BinanceFuturesFeed:
         recv: int,
         parser: Callable[..., Trade],
     ) -> Trade | None:
+        if self._honesty_freeze:
+            # Congelar también el contador de trades para que los contadores
+            # del reporte no deriven durante la ventana de honesty.
+            return None
         try:
             trade = parser(data, ts_recv_ns=recv)
         except (ValueError, KeyError, TypeError) as exc:

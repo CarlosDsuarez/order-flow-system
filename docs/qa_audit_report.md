@@ -38,6 +38,35 @@ Hay **inestabilidad numérica** de OFI/MLOFI entre la muestra ~40 min y esta de 
 | H9 | A | MENOR | Secretos | `.env` gitignored y **inexistente**. Hits = placeholders `.env.example` + `SecretStr` + tests `key-123`. Sin claves reales. |
 | H10 | E | MENOR | Informe backtest | `run_ofi_mm_backtest.py` incrusta el R² **histórico** 0–1.4 % / 22–29 % en el markdown aunque se corra otro dataset. Cosmético. |
 
+### Addendum 2026-09-21 15:02Z — honesty en vivo con compare alineado (H4 cambia)
+
+Run 60 s BTCUSDT (`RUN_INTEGRATION=1 .../test_binance_live_l2.py`, reporte en
+`docs/ingestion/live-validation.md`): protocolo sano — 0 gaps, 0 resyncs,
+0 reconnects, 0 HTTP 429; 574 aplicados / 574 en cola / 0 en vuelo; p50
+99.97 ms, p99 548.7 ms (contexto, no KPI).
+
+Honesty con comparación congelada y alineada: local `...97980` vs REST
+`...90788` (`delta_ids=7192`), `batches_replayed=5` (gate ≤ 1 roto),
+**33/40 (82.5 %)**, max |Δqty| **2.036** (bid 85910.1: 5.965 vs 3.929; ask
+85910.2: 0.677 vs 2.018). **Veredicto: FAIL** (17.5 % ≥ warn 10 %).
+
+Esto **cambia el veredicto H4** ("no es divergencia", banda 95–97.5 % del
+sidecar during-capture): con el test viejo el 10/40 se atribuía a carrera
+temporal; con alineación real el run da 7/40. Dos hipótesis abiertas, sin
+suavizar: (a) divergencia real acumulada en ventana; (b) overshoot de un batch
+final gordo + REST lento (~5 batches ≈ 0.5 s+ de catch-up entre freeze y GET).
+Este run solo no las separa. **El arreglo NO se declara hecho**; umbrales
+intactos (0.10, 0.5 BTC, slack ≤ 1). El **NO-GO de ejecución en vivo** no cambia
+por este fix (no mide latencia ni R²).
+
+Serie de probes offline 15:02x–15:23Z (`docs/ingestion/probe-alignment.md`,
+captura 180 s, 0 gaps, 12 probes alineables): rates 0.0 ×3 exactos, 0.025–0.1
+×5, breaches 0.125–0.40 ×4 (mediana 0.0875). **No es sesgo permanente** (ceros
+exactos lo descartan) **ni spike aislado** (4 breaches). Los breaches
+correlacionan con `delta_ids` grande (overshoot de batch gordo, hasta 20517
+IDs en un batch de 100 ms): el tramo intra-batch final es el límite
+metodológico actual. Veredicto H4 sigue abierto/FAIL; umbrales intactos.
+
 ## Fase A — Higiene
 
 ### Pytest (default, sin `RUN_INTEGRATION`)

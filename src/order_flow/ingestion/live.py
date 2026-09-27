@@ -50,6 +50,10 @@ HONESTY_MAX_SLACK_BATCHES = 1
 #: del run corrupto observado de 2.525). La comparación alineada debería ser
 #: ~exacta; tunable por símbolo.
 MAX_HONESTY_QTY_DISCREPANCY_BTC = 0.5
+#: El mismo backstop para el resto de símbolos, en notional (|Δqty| * precio, USDT):
+#: ≈ 0.5 BTC a ~84k (2026-09). En DOGE/PEPE 0.5 unidades base es ruido, no corrupción.
+#: BTCUSDT sigue en 0.5 BTC exactos para que la serie de auditorías H4 sea comparable.
+MAX_HONESTY_NOTIONAL_DISCREPANCY = 40_000.0
 
 
 def live_duration_s(default: float = DEFAULT_DURATION_S) -> float:
@@ -453,9 +457,27 @@ def _ns_to_ms(value: object) -> str:
     return f"{number / 1_000_000.0:.3f}"
 
 
+def _max_discrepancy_breach(honesty: dict[str, Any], symbol: str) -> str | None:
+    """Texto del FAIL si la peor discrepancia de qty supera el backstop del símbolo."""
+    if symbol.upper() == "BTCUSDT":
+        max_disc = float(honesty.get("max_qty_discrepancy") or 0.0)
+        if max_disc <= MAX_HONESTY_QTY_DISCREPANCY_BTC:
+            return None
+        return f"discrepancia máxima de qty {max_disc} BTC > {MAX_HONESTY_QTY_DISCREPANCY_BTC} BTC"
+    details = honesty.get("mismatch_details") or []
+    worst = max((float(d["abs_diff"]) * float(d["price"]) for d in details), default=0.0)
+    if worst <= MAX_HONESTY_NOTIONAL_DISCREPANCY:
+        return None
+    return (
+        f"discrepancia máxima {worst:.2f} USDT de notional > "
+        f"{MAX_HONESTY_NOTIONAL_DISCREPANCY} USDT"
+    )
+
+
 def _honesty_verdict(
     honesty: dict[str, Any],
     *,
+    symbol: str,
     crossed: bool,
     gaps: int,
     resyncs: int,
@@ -464,7 +486,7 @@ def _honesty_verdict(
     """Veredicto literal del honesty check (sin eufemismos)."""
     mismatches = int(honesty.get("mismatches") or 0)
     compared = int(honesty.get("compared") or 0)
-    max_disc = float(honesty.get("max_qty_discrepancy") or 0.0)
+    breach = _max_discrepancy_breach(honesty, symbol)
     stale = bool(honesty.get("stale"))
     delta_ids = honesty.get("delta_ids")
     batches = int(honesty.get("batches_replayed") or 0)
@@ -487,11 +509,8 @@ def _honesty_verdict(
             f"(tasa {mismatch_rate:.2%} ≥ warn {HONESTY_MISMATCH_WARN:.2%}) con "
             "comparación congelada y alineada: libro corrupto o regresión."
         )
-    elif max_disc > MAX_HONESTY_QTY_DISCREPANCY_BTC:
-        verdict = (
-            f"Veredicto: FAIL — discrepancia máxima de qty {max_disc} BTC > "
-            f"{MAX_HONESTY_QTY_DISCREPANCY_BTC} BTC con comparación alineada."
-        )
+    elif breach is not None:
+        verdict = f"Veredicto: FAIL — {breach} con comparación alineada."
     elif delta_ids is None or delta_ids < 0 or batches > HONESTY_MAX_SLACK_BATCHES:
         verdict = (
             "Veredicto: FAIL — alineación fuera de holgura "
@@ -522,6 +541,7 @@ def _conclusion(report: dict[str, Any]) -> str:
     honesty = report.get("honesty") or {}
     return _honesty_verdict(
         honesty,
+        symbol=str(report.get("symbol") or "BTCUSDT"),
         crossed=bool(report.get("book_crossed")),
         gaps=int(report.get("gaps") or 0),
         resyncs=int(report.get("resyncs") or 0),

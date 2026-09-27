@@ -137,9 +137,7 @@ def _positive_levels(levels: tuple[PriceLevel, ...]) -> list[PriceLevel]:
     return [level for level in levels if level.qty > 0]
 
 
-def _snapshot_level_rows(
-    snapshot: BookSnapshot, *, kind: int
-) -> tuple[list[EventRow], int, int]:
+def _snapshot_level_rows(snapshot: BookSnapshot, *, kind: int) -> tuple[list[EventRow], int, int]:
     """Return (rows, n_positive, n_qty0) for one snapshot's resting levels."""
     rows: list[EventRow] = []
     n_qty0 = 0

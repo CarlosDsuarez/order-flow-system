@@ -17,12 +17,10 @@ from typing import TYPE_CHECKING, Final
 
 from order_flow.ingestion.events import BookDelta, BookSnapshot, PriceLevel, Side, Trade
 from order_flow.storage.parquet import (
-    deltas_from_frame,
     read_events,
-    snapshots_from_frame,
     trades_from_frame,
 )
-from order_flow.storage.reconstruct import book_stream
+from order_flow.storage.reconstruct import book_stream_from_capture
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -185,10 +183,7 @@ def capture_to_ops(
     nautilus's queue estimate), and a snapshot after any chain break always applied as a
     resync (``CLEAR`` + ``ADD``), so no stale level survives it.
     """
-    stream = book_stream(
-        snapshots_from_frame(read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)),
-        deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol)),
-    )
+    stream = book_stream_from_capture(root, exchange=exchange, symbol=symbol)
     trades = trades_from_frame(read_events(root, "trade", exchange=exchange, symbol=symbol))
     batches: list[list[ConvertedDelta]] = []
     for event in stream.events:

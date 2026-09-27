@@ -29,6 +29,7 @@ from order_flow.ingestion.binance_futures import (
     parse_depth_snapshot,
 )
 from order_flow.ingestion.events import BookDelta, BookSnapshot, MarketEvent, Trade
+from order_flow.ingestion.instruments import write_instrument_spec
 from order_flow.ingestion.latency_audit import sample_server_time
 from order_flow.ingestion.live import CATCH_UP_TIMEOUT_S, DEFAULT_HONESTY_LEVELS
 from order_flow.ingestion.sync import compare_top_levels
@@ -228,6 +229,28 @@ async def _fetch_rest_snapshot(feed: BinanceFuturesFeed) -> BookSnapshot:
         return parse_depth_snapshot(orjson.loads(response.content), feed.symbol)
 
 
+async def _record_instrument_spec(
+    feed: BinanceFuturesFeed, out: Path | None
+) -> dict[str, str] | None:
+    """Fetch the symbol's tick / lot grid; write ``instrument.json`` next to the Parquet.
+
+    Not fatal on failure: recording does not need the spec, only replay does.
+    """
+    try:
+        async with httpx.AsyncClient(base_url=feed.rest_url, timeout=feed.timeout_s) as client:
+            spec = await feed.fetch_instrument_spec(client)
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        log.warning(
+            "instrument_spec_unavailable",
+            symbol=feed.symbol,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    if out is not None:
+        write_instrument_spec(out, spec)
+    return spec.to_dict()
+
+
 async def _append_clock_offset(
     path: Path, feed: BinanceFuturesFeed, phase: str, *, n: int = 1
 ) -> None:
@@ -382,6 +405,7 @@ async def _record(
     probe_task: asyncio.Task[None] | None = None
     shutdown = asyncio.Event()
     interrupted: str | None = None
+    instrument: dict[str, str] | None = None
 
     def on_signal(sig: signal.Signals) -> None:
         nonlocal interrupted
@@ -391,6 +415,7 @@ async def _record(
 
     remove_handlers = install_shutdown_handlers(on_signal)
     try:
+        instrument = await _record_instrument_spec(feed, out)
         await feed.start()
         if rest_probe_every > 0 and out is not None:
             probe_task = asyncio.create_task(
@@ -496,6 +521,7 @@ async def _record(
         "stale_disconnects": feed.stats.stale_disconnects,
         "queue_high_watermark": feed.stats.queue_high_watermark,
         "interrupted": interrupted,
+        "instrument": instrument,
         "latency_ns": feed.stats.latency_summary(),
         "dual_sockets": feed.dual_sockets,
         "honesty": honesty,

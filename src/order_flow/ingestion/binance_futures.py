@@ -38,6 +38,7 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, suppress
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Final, Literal, NoReturn
 
 import httpx
@@ -53,6 +54,7 @@ from order_flow.ingestion.events import (
     Side,
     Trade,
 )
+from order_flow.ingestion.instruments import InstrumentSpec
 from order_flow.ingestion.sync import (
     DepthDecision,
     DepthSequenceValidator,
@@ -70,6 +72,8 @@ DEFAULT_WS_URL: Final = "wss://fstream.binance.com/stream"
 DEFAULT_RAW_WS_URL: Final = "wss://fstream.binance.com/ws"
 DEFAULT_REST_URL: Final = "https://fapi.binance.com"
 DEPTH_SNAPSHOT_PATH: Final = "/fapi/v1/depth"
+# All symbols in one response (the futures endpoint has no ``symbol`` filter); weight 1.
+EXCHANGE_INFO_PATH: Final = "/fapi/v1/exchangeInfo"
 LATENCY_LOG_EVERY: Final = 200
 MAX_SNAPSHOT_RETRIES: Final = 8
 # A session that synced and stayed up this long resets the reconnect backoff to its
@@ -157,6 +161,7 @@ __all__ = [
     "DEFAULT_WS_URL",
     "DEPTH_SNAPSHOT_PATH",
     "EXCHANGE",
+    "EXCHANGE_INFO_PATH",
     "BinanceFuturesFeed",
     "DepthSequenceValidator",
     "FeedStats",
@@ -164,6 +169,7 @@ __all__ = [
     "parse_agg_trade",
     "parse_depth_snapshot",
     "parse_depth_update",
+    "parse_exchange_info",
     "parse_trade",
     "unwrap_stream_message",
 ]
@@ -285,6 +291,34 @@ def parse_depth_snapshot(
         last_update_id=int(payload["lastUpdateId"]),
         bids=_levels(payload["bids"]),
         asks=_levels(payload["asks"]),
+    )
+
+
+def parse_exchange_info(payload: Mapping[str, Any], symbol: str) -> InstrumentSpec:
+    """Grid of ``symbol`` from ``GET /fapi/v1/exchangeInfo``.
+
+    ``PRICE_FILTER`` gives tick and price bounds, ``LOT_SIZE`` (limit orders, not
+    ``MARKET_LOT_SIZE``) the lot and quantity bounds, ``MIN_NOTIONAL`` the notional floor.
+    """
+    wanted = symbol.upper()
+    entry = next((item for item in payload["symbols"] if item["symbol"] == wanted), None)
+    if entry is None:
+        msg = f"{wanted} not listed in exchangeInfo"
+        raise ValueError(msg)
+    filters = {item["filterType"]: item for item in entry["filters"]}
+    price, lot = filters["PRICE_FILTER"], filters["LOT_SIZE"]
+    return InstrumentSpec(
+        exchange=EXCHANGE,
+        symbol=wanted,
+        base_asset=entry["baseAsset"],
+        quote_asset=entry["quoteAsset"],
+        tick_size=Decimal(price["tickSize"]),
+        lot_size=Decimal(lot["stepSize"]),
+        min_price=Decimal(price["minPrice"]),
+        max_price=Decimal(price["maxPrice"]),
+        min_qty=Decimal(lot["minQty"]),
+        max_qty=Decimal(lot["maxQty"]),
+        min_notional=Decimal(filters["MIN_NOTIONAL"]["notional"]),
     )
 
 
@@ -496,6 +530,12 @@ class BinanceFuturesFeed:
         )
         response.raise_for_status()
         return parse_depth_snapshot(orjson.loads(response.content), self.symbol)
+
+    async def fetch_instrument_spec(self, client: httpx.AsyncClient) -> InstrumentSpec:
+        """Current tick / lot grid of :attr:`symbol`. Raises on HTTP errors."""
+        response = await client.get(EXCHANGE_INFO_PATH)
+        response.raise_for_status()
+        return parse_exchange_info(orjson.loads(response.content), self.symbol)
 
     async def start(self) -> None:
         """Run the reconnect loop in a background task, publishing to :attr:`queue`."""

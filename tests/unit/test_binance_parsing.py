@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 
 from order_flow.ingestion.binance_futures import (
+    DEFAULT_REST_URL,
     EXCHANGE,
+    EXCHANGE_INFO_PATH,
+    BinanceFuturesFeed,
     DepthSequenceValidator,
     parse_agg_trade,
     parse_depth_snapshot,
     parse_depth_update,
+    parse_exchange_info,
     parse_trade,
     unwrap_stream_message,
 )
@@ -179,3 +185,69 @@ class TestDepthSequenceValidator:
         validator.validate(make_delta(995, 1003, 994))
         with pytest.raises(SequenceGapError):
             validator.validate(make_delta(995, 1003, 994))
+
+
+def exchange_info_payload() -> dict[str, Any]:
+    """Trimmed ``GET /fapi/v1/exchangeInfo`` (real 1000PEPEUSDT filters, 2026-09-26)."""
+    return {
+        "timezone": "UTC",
+        "symbols": [
+            {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "filters": []},
+            {
+                "symbol": "1000PEPEUSDT",
+                "baseAsset": "1000PEPE",
+                "quoteAsset": "USDT",
+                "filters": [
+                    {
+                        "filterType": "PRICE_FILTER",
+                        "minPrice": "0.0000001",
+                        "maxPrice": "200",
+                        "tickSize": "0.0000001",
+                    },
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "1",
+                        "maxQty": "800000000",
+                        "stepSize": "1",
+                    },
+                    {
+                        "filterType": "MARKET_LOT_SIZE",
+                        "minQty": "1",
+                        "maxQty": "80000000",
+                        "stepSize": "1",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                ],
+            },
+        ],
+    }
+
+
+def test_parse_exchange_info_extracts_the_symbol_grid() -> None:
+    spec = parse_exchange_info(exchange_info_payload(), "1000pepeusdt")
+    assert spec.exchange == EXCHANGE
+    assert spec.symbol == "1000PEPEUSDT"
+    assert (spec.base_asset, spec.quote_asset) == ("1000PEPE", "USDT")
+    assert spec.tick_size == Decimal("0.0000001")
+    assert spec.lot_size == Decimal("1")  # LOT_SIZE, not MARKET_LOT_SIZE
+    assert spec.max_qty == Decimal("800000000")
+    assert spec.min_notional == Decimal("5")
+    assert (spec.price_precision, spec.size_precision) == (7, 0)
+
+
+def test_parse_exchange_info_rejects_unknown_symbol() -> None:
+    with pytest.raises(ValueError, match="DOGEUSDT"):
+        parse_exchange_info(exchange_info_payload(), "DOGEUSDT")
+
+
+async def test_feed_fetches_its_instrument_spec() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json=exchange_info_payload())
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=DEFAULT_REST_URL)
+    spec = await BinanceFuturesFeed("1000PEPEUSDT").fetch_instrument_spec(client)
+    assert paths == [EXCHANGE_INFO_PATH]
+    assert spec.tick_size == Decimal("0.0000001")

@@ -187,9 +187,12 @@ def capture_to_ops(
     )
     deltas = deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol))
     trades = trades_from_frame(read_events(root, "trade", exchange=exchange, symbol=symbol))
+    # Same order as storage.reconstruct: (ts, u, delta before snapshot). A periodic
+    # snapshot shares ts and u with the delta it was taken after, so it must sort after
+    # that delta to match ``last_id`` and be skipped (QA H2).
     merged: list[tuple[int, int, int, BookSnapshot | BookDelta]] = []
-    merged.extend((snap.ts_event_ns, 0, snap.last_update_id, snap) for snap in snapshots)
-    merged.extend((delta.ts_event_ns, 1, delta.final_update_id, delta) for delta in deltas)
+    merged.extend((snap.ts_event_ns, snap.last_update_id, 1, snap) for snap in snapshots)
+    merged.extend((delta.ts_event_ns, delta.final_update_id, 0, delta) for delta in deltas)
     merged.sort()
     last_id: int | None = None
     batches: list[list[ConvertedDelta]] = []

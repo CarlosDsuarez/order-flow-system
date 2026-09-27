@@ -23,6 +23,7 @@ from order_flow.backtest.conversion import (
     trade_to_print,
 )
 from order_flow.ingestion.events import Side
+from order_flow.orderbook.book import OrderBook
 from order_flow.storage.parquet import ParquetWriter
 from tests.helpers import EXCHANGE, SYMBOL, T0_NS, make_delta, make_snapshot, make_trade
 
@@ -137,6 +138,24 @@ def test_capture_skips_periodic_snapshot_with_same_update_id(tmp_path: Path) -> 
     assert book_batches[2][0].action is BookOp.CLEAR
     assert len(trades) == 1
     assert trades[0].trade_id == 1
+
+
+def test_capture_skips_periodic_snapshot_sharing_the_delta_timestamp(tmp_path: Path) -> None:
+    # record_l2 writes periodic snapshots from its live book, so they carry the ts and u
+    # of the delta just applied (QA H2: 0/884 were skipped). Each extra CLEAR + ADD made
+    # nautilus reset its estimated queue position once per snapshot interval.
+    book = OrderBook(exchange=EXCHANGE, symbol=SYMBOL)
+    rest = make_snapshot(last_update_id=100, ts_event_ns=T0_NS)
+    delta = make_delta(95, 105, 90, bids=((100.0, 12.0),), ts_event_ns=T0_NS + NS)
+    book.apply_snapshot(rest)
+    book.apply_delta(delta)
+    periodic = book.snapshot()
+    assert (periodic.ts_event_ns, periodic.last_update_id) == (delta.ts_event_ns, 105)
+    with ParquetWriter(tmp_path, EXCHANGE, SYMBOL) as writer:
+        writer.write([rest, delta, periodic])
+
+    book_batches, _ = capture_to_ops(tmp_path, exchange=EXCHANGE, symbol=SYMBOL, tick=TICK)
+    assert [batch[0].action for batch in book_batches] == [BookOp.CLEAR, BookOp.UPDATE]
 
 
 def test_capture_drops_zero_qty_trades(tmp_path: Path) -> None:

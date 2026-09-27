@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -139,3 +141,99 @@ def test_writer_rejects_other_instruments(tmp_path: Path) -> None:
 def test_flush_without_events_creates_nothing(tmp_path: Path) -> None:
     ParquetWriter(tmp_path, EXCHANGE, SYMBOL).flush()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_flush_never_overwrites_an_existing_part(tmp_path: Path) -> None:
+    writer = ParquetWriter(tmp_path, EXCHANGE, SYMBOL)
+    for trade_id in (1, 2):
+        writer.write([make_trade(trade_id, 1.0, 1.0, Side.BUY)])
+        writer.flush()
+    (partition(tmp_path, "trade") / "part-00000.parquet").unlink()  # e.g. manual cleanup
+    writer.write([make_trade(3, 1.0, 1.0, Side.SELL)])
+    writer.flush()
+    files = sorted(p.name for p in partition(tmp_path, "trade").glob("*.parquet"))
+    assert files == ["part-00001.parquet", "part-00002.parquet"]
+    assert read_events(tmp_path, "trade")["trade_id"].to_list() == [2, 3]
+
+
+def test_failed_flush_leaves_no_partial_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def crash_mid_write(_frame: pl.DataFrame, file: Path, **_kwargs: object) -> None:
+        file.write_bytes(b"PAR1-truncated")  # power cut / disk full halfway through
+        raise OSError("disk full")
+
+    writer = ParquetWriter(tmp_path, EXCHANGE, SYMBOL)
+    writer.write([make_trade(1, 1.0, 1.0, Side.BUY)])
+    writer.flush()
+    writer.write([make_trade(2, 1.0, 1.0, Side.BUY)])
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", crash_mid_write)
+    with pytest.raises(OSError, match="disk full"):
+        writer.flush()
+    monkeypatch.undo()
+
+    leftovers = sorted(p.name for p in partition(tmp_path, "trade").iterdir())
+    assert leftovers == ["part-00000.parquet"]
+    assert read_events(tmp_path, "trade")["trade_id"].to_list() == [1]
+
+
+def test_auto_flush_can_be_disabled(tmp_path: Path) -> None:
+    writer = ParquetWriter(tmp_path, EXCHANGE, SYMBOL, buffer_size=1, auto_flush=False)
+    writer.write([make_trade(1, 1.0, 1.0, Side.BUY), make_trade(2, 1.0, 1.0, Side.BUY)])
+    assert writer.pending == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def gate_parquet_writes(monkeypatch: pytest.MonkeyPatch, gate: threading.Event) -> None:
+    """Hold the first ``write_parquet`` call until ``gate`` is set (a slow disk)."""
+    real = pl.DataFrame.write_parquet
+    calls = 0
+
+    def gated(frame: pl.DataFrame, file: Path, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            gate.wait(2.0)
+        real(frame, file, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", gated)
+
+
+async def test_flush_async_keeps_event_loop_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = threading.Event()
+    gate_parquet_writes(monkeypatch, gate)
+    writer = ParquetWriter(tmp_path, EXCHANGE, SYMBOL, auto_flush=False)
+    writer.write([make_trade(1, 1.0, 1.0, Side.BUY)])
+
+    flushing = asyncio.create_task(writer.flush_async())
+    ticks = 0
+    while not flushing.done() and ticks < 10:  # the WS pump would run in these slots
+        await asyncio.sleep(0.001)
+        ticks += 1
+    assert ticks == 10
+    assert writer.pending == 0  # buffer handed off; new events go to a fresh batch
+    gate.set()
+    await flushing
+    assert read_events(tmp_path, "trade")["trade_id"].to_list() == [1]
+
+
+async def test_concurrent_flushes_never_share_a_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = threading.Event()
+    gate_parquet_writes(monkeypatch, gate)
+    writer = ParquetWriter(tmp_path, EXCHANGE, SYMBOL, auto_flush=False)
+    writer.write([make_trade(1, 1.0, 1.0, Side.BUY)])
+    first = asyncio.create_task(writer.flush_async())
+    await asyncio.sleep(0.05)  # first flush is now stuck inside the disk write
+    writer.write([make_trade(2, 1.0, 1.0, Side.BUY)])
+    second = asyncio.create_task(writer.flush_async())
+    await asyncio.sleep(0.05)
+    gate.set()
+    await asyncio.gather(first, second)
+
+    files = sorted(p.name for p in partition(tmp_path, "trade").iterdir())
+    assert files == ["part-00000.parquet", "part-00001.parquet"]
+    assert read_events(tmp_path, "trade")["trade_id"].to_list() == [1, 2]

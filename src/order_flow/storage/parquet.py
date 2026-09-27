@@ -16,10 +16,14 @@ Timestamps are int64 nanoseconds since the Unix epoch, L2 levels are
 
 from __future__ import annotations
 
+import asyncio
+import os
+import re
+import threading
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, TypeVar
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple, TypeVar
 
 import polars as pl
 
@@ -32,6 +36,8 @@ if TYPE_CHECKING:
     from order_flow.ingestion.events import MarketEvent
 
 ParquetCompression = Literal["zstd", "snappy", "lz4", "gzip", "uncompressed"]
+
+_PART_RE: Final = re.compile(r"part-(\d+)\.parquet")
 
 LEVELS_DTYPE: Final = pl.List(pl.Struct({"price": pl.Float64(), "qty": pl.Float64()}))
 
@@ -208,12 +214,22 @@ def _utc_date(ts_ns: int) -> str:
 
 
 # --------------------------------------------------------------------------- writer
+class _Batch(NamedTuple):
+    snapshots: list[BookSnapshot]
+    deltas: list[BookDelta]
+    trades: list[Trade]
+
+
 class ParquetWriter:
     """Buffered :class:`~order_flow.storage.base.EventSink` writing partitioned Parquet.
 
     Events are grouped by type and UTC date; each :meth:`flush` appends one new
     ``part-<n>.parquet`` file per (type, date) partition. Use as a context manager to
     guarantee the final flush.
+
+    Inside an event loop, pass ``auto_flush=False`` and call :meth:`flush_async`: the disk
+    write then runs in a worker thread instead of stalling the WebSocket pump. A failed
+    flush raises and its batch is not retried.
     """
 
     def __init__(
@@ -224,6 +240,7 @@ class ParquetWriter:
         *,
         buffer_size: int = 10_000,
         compression: ParquetCompression = "zstd",
+        auto_flush: bool = True,
     ) -> None:
         if buffer_size < 1:
             msg = "buffer_size must be >= 1"
@@ -233,6 +250,9 @@ class ParquetWriter:
         self.symbol = symbol
         self.buffer_size = buffer_size
         self.compression: ParquetCompression = compression
+        self.auto_flush = auto_flush
+        # Serialises disk writes: two in-flight flushes would pick the same part index.
+        self._write_lock = threading.Lock()
         self._snapshots: list[BookSnapshot] = []
         self._deltas: list[BookDelta] = []
         self._trades: list[Trade] = []
@@ -244,7 +264,7 @@ class ParquetWriter:
         return self._pending
 
     def write(self, events: Sequence[MarketEvent]) -> None:
-        """Buffer ``events``; flushes automatically once ``buffer_size`` is reached.
+        """Buffer ``events``; with ``auto_flush`` flushes once ``buffer_size`` is reached.
 
         Raises:
             ValueError: If an event belongs to a different exchange/symbol.
@@ -263,18 +283,29 @@ class ParquetWriter:
             else:
                 self._trades.append(event)
         self._pending += len(events)
-        if self._pending >= self.buffer_size:
+        if self.auto_flush and self._pending >= self.buffer_size:
             self.flush()
 
     def flush(self) -> None:
         """Write every buffered event to its partition."""
-        self._write_partitions("book_snapshot", self._snapshots, snapshots_to_frame)
-        self._write_partitions("book_delta", self._deltas, deltas_to_frame)
-        self._write_partitions("trade", self._trades, trades_to_frame)
-        self._snapshots.clear()
-        self._deltas.clear()
-        self._trades.clear()
+        self._write_batch(self._take_batch())
+
+    async def flush_async(self) -> None:
+        """Hand the buffer off and write it from a worker thread."""
+        batch = self._take_batch()
+        await asyncio.to_thread(self._write_batch, batch)
+
+    def _take_batch(self) -> _Batch:
+        batch = _Batch(self._snapshots, self._deltas, self._trades)
+        self._snapshots, self._deltas, self._trades = [], [], []
         self._pending = 0
+        return batch
+
+    def _write_batch(self, batch: _Batch) -> None:
+        with self._write_lock:
+            self._write_partitions("book_snapshot", batch.snapshots, snapshots_to_frame)
+            self._write_partitions("book_delta", batch.deltas, deltas_to_frame)
+            self._write_partitions("trade", batch.trades, trades_to_frame)
 
     def close(self) -> None:
         """Flush; kept for :class:`~order_flow.storage.base.EventSink` symmetry."""
@@ -300,10 +331,15 @@ class ParquetWriter:
         for date, group in sorted(by_date.items()):
             directory = self.partition_dir(event_type, date)
             directory.mkdir(parents=True, exist_ok=True)
-            part = sum(1 for _ in directory.glob("part-*.parquet"))
-            to_frame(group).write_parquet(
-                directory / f"part-{part:05d}.parquet", compression=self.compression
-            )
+            final = directory / f"part-{_next_part_index(directory):05d}.parquet"
+            # Write beside the target, then rename: a crash mid-write never leaves a
+            # truncated ``part-*.parquet`` that would break every scan of the partition.
+            tmp = directory / f".{final.name}.tmp"
+            try:
+                to_frame(group).write_parquet(tmp, compression=self.compression)
+                os.replace(tmp, final)
+            finally:
+                tmp.unlink(missing_ok=True)
 
     def partition_dir(self, event_type: EventType, date: str) -> Path:
         """Directory holding ``event_type`` files for ``date`` (``YYYY-MM-DD``)."""
@@ -314,6 +350,12 @@ class ParquetWriter:
             / f"symbol={self.symbol}"
             / f"date={date}"
         )
+
+
+def _next_part_index(directory: Path) -> int:
+    """One past the highest ``part-<n>``, so a deleted part never causes an overwrite."""
+    indices = [int(m.group(1)) for p in directory.iterdir() if (m := _PART_RE.fullmatch(p.name))]
+    return max(indices, default=-1) + 1
 
 
 # --------------------------------------------------------------------------- reader

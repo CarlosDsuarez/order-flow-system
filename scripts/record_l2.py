@@ -35,7 +35,12 @@ from order_flow.ingestion.live import CATCH_UP_TIMEOUT_S, DEFAULT_HONESTY_LEVELS
 from order_flow.ingestion.sync import compare_top_levels
 from order_flow.orderbook.book import OrderBook
 from order_flow.orderbook.errors import SequenceGapError
-from order_flow.storage.parquet import ParquetWriter, read_events, snapshots_from_frame
+from order_flow.storage.parquet import (
+    LowDiskSpaceError,
+    ParquetWriter,
+    read_events,
+    snapshots_from_frame,
+)
 from order_flow.storage.reconstruct import reconstruct_book
 from order_flow.storage.report import capture_stats, format_capture_report
 from order_flow.utils.logging import configure_logging, get_logger
@@ -43,6 +48,7 @@ from order_flow.utils.shutdown import install_shutdown_handlers
 
 if TYPE_CHECKING:
     import signal
+    from collections.abc import Callable
 
 log = get_logger(__name__)
 
@@ -50,6 +56,7 @@ DEFAULT_CAPTURE_S = 300.0
 DEFAULT_SNAPSHOT_INTERVAL_S = 1.0
 DEFAULT_FLUSH_INTERVAL_S = 2.0
 DEFAULT_BUFFER_SIZE = 2_000
+DEFAULT_MIN_FREE_GB = 2.0
 
 
 def capture_seconds(default: float = DEFAULT_CAPTURE_S) -> float:
@@ -93,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between Parquet flushes (in addition to buffer_size)",
     )
     parser.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER_SIZE)
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_GB,
+        help="Stop cleanly (meta still written) when the disk has less free space than this",
+    )
     parser.add_argument("--honesty-levels", type=int, default=DEFAULT_HONESTY_LEVELS)
     parser.add_argument(
         "--rest-probe-every",
@@ -374,6 +387,18 @@ def _format_live_capture_md(meta: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _post_capture(check: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Run one post-capture check; a failure is recorded, never loses capture_meta.json.
+
+    A run that stops before its first flush (network, low disk, early SIGTERM) has no
+    Parquet to reconstruct, and that is exactly when the meta matters most.
+    """
+    try:
+        return check()
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 async def _record(
     symbol: str,
     seconds: float,
@@ -382,6 +407,7 @@ async def _record(
     snapshot_interval: float,
     flush_interval: float,
     buffer_size: int,
+    min_free_bytes: int = 0,
     honesty_levels: int,
     report_path: Path | None,
     rest_probe_every: float = 0.0,
@@ -395,7 +421,12 @@ async def _record(
         # auto_flush=False: flushes are awaited below and run in a worker thread, so a
         # disk write never stalls the WebSocket pump sharing this event loop.
         writer = ParquetWriter(
-            out, EXCHANGE, feed.symbol, buffer_size=buffer_size, auto_flush=False
+            out,
+            EXCHANGE,
+            feed.symbol,
+            buffer_size=buffer_size,
+            auto_flush=False,
+            min_free_bytes=min_free_bytes,
         )
     n_snap = n_delta = n_trade = n_periodic = 0
     honesty: dict[str, Any] | None = None
@@ -495,7 +526,11 @@ async def _record(
                     handle.write(orjson.dumps(payload).decode() + "\n")
         await feed.stop()
         if writer is not None:
-            writer.close()
+            try:
+                writer.close()
+            except LowDiskSpaceError as exc:
+                # Keep going: the small meta JSON below is what explains the stop.
+                error = error or f"{type(exc).__name__}: {exc}"
         remove_handlers()
     elapsed = time.monotonic() - started
     print(
@@ -529,14 +564,24 @@ async def _record(
         "rest_url": DEFAULT_REST_URL,
     }
     if out is not None:
-        if book.last_update_id is not None:
-            meta["end_reconstruct"] = _end_reconstruct_match(out, book, EXCHANGE, feed.symbol)
-            meta["mid_reconstruct"] = _mid_snapshot_consistency(out, EXCHANGE, feed.symbol)
-        stats = capture_stats(out, exchange=EXCHANGE, symbol=feed.symbol)
-        meta["capture_report"] = format_capture_report(stats)
-        meta["bytes_total"] = stats.bytes_total
-        meta["deltas_per_s"] = stats.deltas_per_s
-        meta["trades_per_s"] = stats.trades_per_s
+        # After a signal, skip the replay checks (they read the whole capture) so the
+        # run ends inside the supervisor's kill timeout; validate_capture covers them.
+        if book.last_update_id is not None and not shutdown.is_set():
+            meta["end_reconstruct"] = _post_capture(
+                lambda: _end_reconstruct_match(out, book, EXCHANGE, feed.symbol)
+            )
+            meta["mid_reconstruct"] = _post_capture(
+                lambda: _mid_snapshot_consistency(out, EXCHANGE, feed.symbol)
+            )
+        try:
+            stats = capture_stats(out, exchange=EXCHANGE, symbol=feed.symbol)
+        except Exception as exc:
+            meta["capture_report"] = f"capture_stats failed: {type(exc).__name__}: {exc}"
+        else:
+            meta["capture_report"] = format_capture_report(stats)
+            meta["bytes_total"] = stats.bytes_total
+            meta["deltas_per_s"] = stats.deltas_per_s
+            meta["trades_per_s"] = stats.trades_per_s
         (out / "capture_meta.json").write_text(json.dumps(meta, indent=2, default=str) + "\n")
         print(meta["capture_report"])
         print(f"end_reconstruct={meta.get('end_reconstruct')}")
@@ -561,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
             snapshot_interval=args.snapshot_interval,
             flush_interval=args.flush_interval,
             buffer_size=args.buffer_size,
+            min_free_bytes=int(args.min_free_gb * 1e9),
             honesty_levels=args.honesty_levels,
             report_path=args.report,
             rest_probe_every=args.rest_probe_every,

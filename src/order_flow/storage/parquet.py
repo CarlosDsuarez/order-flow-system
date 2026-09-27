@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import threading
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -38,6 +39,19 @@ if TYPE_CHECKING:
 ParquetCompression = Literal["zstd", "snappy", "lz4", "gzip", "uncompressed"]
 
 _PART_RE: Final = re.compile(r"part-(\d+)\.parquet")
+
+
+class LowDiskSpaceError(OSError):
+    """Free space under the writer's floor: refuse to flush rather than fill the disk."""
+
+
+def _fsync(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
 
 LEVELS_DTYPE: Final = pl.List(pl.Struct({"price": pl.Float64(), "qty": pl.Float64()}))
 
@@ -241,6 +255,7 @@ class ParquetWriter:
         buffer_size: int = 10_000,
         compression: ParquetCompression = "zstd",
         auto_flush: bool = True,
+        min_free_bytes: int = 0,
     ) -> None:
         if buffer_size < 1:
             msg = "buffer_size must be >= 1"
@@ -251,6 +266,7 @@ class ParquetWriter:
         self.buffer_size = buffer_size
         self.compression: ParquetCompression = compression
         self.auto_flush = auto_flush
+        self.min_free_bytes = min_free_bytes
         # Serialises disk writes: two in-flight flushes would pick the same part index.
         self._write_lock = threading.Lock()
         self._snapshots: list[BookSnapshot] = []
@@ -287,13 +303,31 @@ class ParquetWriter:
             self.flush()
 
     def flush(self) -> None:
-        """Write every buffered event to its partition."""
+        """Write every buffered event to its partition.
+
+        Raises:
+            LowDiskSpaceError: Free space under ``min_free_bytes``; the buffer is kept.
+        """
+        self._check_free_space()
         self._write_batch(self._take_batch())
 
     async def flush_async(self) -> None:
-        """Hand the buffer off and write it from a worker thread."""
+        """Hand the buffer off and write it from a worker thread (same checks as flush)."""
+        self._check_free_space()
         batch = self._take_batch()
         await asyncio.to_thread(self._write_batch, batch)
+
+    def _check_free_space(self) -> None:
+        if not self._pending or self.min_free_bytes <= 0:
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(self.root).free
+        if free < self.min_free_bytes:
+            msg = (
+                f"only {free / 1e9:.2f} GB free under {self.root}, below the "
+                f"{self.min_free_bytes / 1e9:.2f} GB floor; not flushing"
+            )
+            raise LowDiskSpaceError(msg)
 
     def _take_batch(self) -> _Batch:
         batch = _Batch(self._snapshots, self._deltas, self._trades)
@@ -337,9 +371,12 @@ class ParquetWriter:
             tmp = directory / f".{final.name}.tmp"
             try:
                 to_frame(group).write_parquet(tmp, compression=self.compression)
+                _fsync(tmp)  # data on disk before the name points at it
                 os.replace(tmp, final)
             finally:
                 tmp.unlink(missing_ok=True)
+            if os.name == "posix":
+                _fsync(directory)  # and the rename itself
 
     def partition_dir(self, event_type: EventType, date: str) -> Path:
         """Directory holding ``event_type`` files for ``date`` (``YYYY-MM-DD``)."""

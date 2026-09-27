@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import threading
 from typing import TYPE_CHECKING
 
@@ -15,6 +17,7 @@ from order_flow.storage.parquet import (
     BOOK_DELTA_SCHEMA,
     PARTITION_DIR,
     TRADE_SCHEMA,
+    LowDiskSpaceError,
     ParquetWriter,
     read_events,
     scan_events,
@@ -237,3 +240,43 @@ async def test_concurrent_flushes_never_share_a_part(
     files = sorted(p.name for p in partition(tmp_path, "trade").iterdir())
     assert files == ["part-00000.parquet", "part-00001.parquet"]
     assert read_events(tmp_path, "trade")["trade_id"].to_list() == [1, 2]
+
+
+def test_part_is_fsynced_before_and_after_the_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without fsync a power cut after the rename can leave a zero-length part under its
+    # final name. Data first, then the rename, then the directory entry.
+    calls: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd: int) -> None:
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        calls.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    writer = ParquetWriter(tmp_path, EXCHANGE, SYMBOL)
+    writer.write([make_trade(1, 1.0, 1.0, Side.BUY)])
+    writer.flush()
+    assert calls == ["fsync", "replace", "fsync"]
+
+
+def test_flush_refuses_to_write_below_the_free_space_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    usage = shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(
+        "order_flow.storage.parquet.shutil.disk_usage",
+        lambda _path: usage._replace(free=500_000_000),
+    )
+    writer = ParquetWriter(tmp_path, EXCHANGE, SYMBOL, min_free_bytes=1_000_000_000)
+    writer.write([make_trade(1, 1.0, 1.0, Side.BUY)])
+    with pytest.raises(LowDiskSpaceError, match="free"):
+        writer.flush()
+    assert writer.pending == 1  # kept: nothing was handed off or half-written
+    assert list(tmp_path.iterdir()) == []

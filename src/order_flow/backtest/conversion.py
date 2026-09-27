@@ -22,6 +22,7 @@ from order_flow.storage.parquet import (
     snapshots_from_frame,
     trades_from_frame,
 )
+from order_flow.storage.reconstruct import book_stream
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -179,33 +180,24 @@ def capture_to_ops(
 ) -> tuple[list[list[ConvertedDelta]], list[ConvertedTrade]]:
     """Load a hive capture and emit book-delta batches plus trades.
 
-    Periodic snapshots that repeat the live ``last_update_id`` are skipped; a
-    snapshot with a new id is treated as a resync (``CLEAR`` + ``ADD``).
+    Book events come from :func:`~order_flow.storage.reconstruct.book_stream`: update-id
+    order, periodic snapshots of an intact chain skipped (each CLEAR would reset
+    nautilus's queue estimate), and a snapshot after any chain break always applied as a
+    resync (``CLEAR`` + ``ADD``), so no stale level survives it.
     """
-    snapshots = snapshots_from_frame(
-        read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)
+    stream = book_stream(
+        snapshots_from_frame(read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)),
+        deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol)),
     )
-    deltas = deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol))
     trades = trades_from_frame(read_events(root, "trade", exchange=exchange, symbol=symbol))
-    # Same order as storage.reconstruct: (ts, u, delta before snapshot). A periodic
-    # snapshot shares ts and u with the delta it was taken after, so it must sort after
-    # that delta to match ``last_id`` and be skipped (QA H2).
-    merged: list[tuple[int, int, int, BookSnapshot | BookDelta]] = []
-    merged.extend((snap.ts_event_ns, snap.last_update_id, 1, snap) for snap in snapshots)
-    merged.extend((delta.ts_event_ns, delta.final_update_id, 0, delta) for delta in deltas)
-    merged.sort()
-    last_id: int | None = None
     batches: list[list[ConvertedDelta]] = []
-    for _ts, _kind, _uid, event in merged:
-        if isinstance(event, BookSnapshot):
-            if last_id is not None and event.last_update_id == last_id:
-                continue
-            batches.append(snapshot_to_ops(event, tick=tick))
-            last_id = event.last_update_id
-            continue
-        ops = delta_to_ops(event, tick=tick)
+    for event in stream.events:
+        ops = (
+            snapshot_to_ops(event, tick=tick)
+            if isinstance(event, BookSnapshot)
+            else delta_to_ops(event, tick=tick)
+        )
         if ops:
             batches.append(ops)
-        last_id = event.final_update_id
     prints = [trade_to_print(trade) for trade in trades if trade.qty > 0]
     return batches, prints

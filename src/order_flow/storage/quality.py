@@ -60,7 +60,8 @@ def _chain(snapshots: pl.DataFrame, deltas: pl.DataFrame) -> tuple[int, int]:
 
     Only applied deltas are recorded, so walking them by ``u`` must see ``pu`` equal to
     the previous ``u``. A jump is a resync, and is explained, when the delta brackets
-    some snapshot id (``U <= lastUpdateId <= u``); otherwise it is a break. Event time
+    some snapshot id (``U <= lastUpdateId <= u``) or continues one (``pu == id``);
+    otherwise it is a break. Event time
     is not used: a REST snapshot's ``E`` is its response time and can be later than
     the ``E`` of the diff that brackets it.
     """
@@ -75,8 +76,12 @@ def _chain(snapshots: pl.DataFrame, deltas: pl.DataFrame) -> tuple[int, int]:
         strict=True,
     ):
         if last_u is None or pu != last_u:
+            # Resync: the delta brackets a snapshot id, or continues one (pu == id),
+            # the two cases OrderBook.apply_delta accepts right after a snapshot.
             index = int(np.searchsorted(snapshot_ids, first))
-            if index < snapshot_ids.size and snapshot_ids[index] <= u:
+            brackets = index < snapshot_ids.size and snapshot_ids[index] <= u
+            continues = bool(np.isin(pu, snapshot_ids))
+            if brackets or continues:
                 epochs += 1
             else:
                 breaks += 1

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from order_flow.ingestion.binance_futures import EXCHANGE
+from order_flow.storage.parquet import part_files
 from order_flow.storage.report import (
     DEFAULT_GAP_NS,
     capture_stats,
@@ -56,10 +57,7 @@ def _duckdb_histogram(root: Path, exchange: str, symbol: str) -> str | None:
         import duckdb
     except ImportError:
         return None
-    pattern = str(
-        root / "deltas" / f"exchange={exchange}" / f"symbol={symbol}" / "date=*" / "*.parquet"
-    )
-    files = list(Path(root).glob(f"deltas/exchange={exchange}/symbol={symbol}/date=*/*.parquet"))
+    files = [str(path) for path in part_files(root, "book_delta", exchange=exchange, symbol=symbol)]
     if not files:
         return "(sin archivos de deltas)"
     con = duckdb.connect()
@@ -71,7 +69,7 @@ def _duckdb_histogram(root: Path, exchange: str, symbol: str) -> str | None:
         GROUP BY 1
         ORDER BY 1
         """,
-        [pattern],
+        [files],
     ).fetchdf()
     if frame.empty:
         return "(vacío)"

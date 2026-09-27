@@ -4,15 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import pairwise
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import polars as pl
 
-from order_flow.storage.parquet import PARTITION_DIR, read_events
+from order_flow.storage.parquet import part_files, read_events
 from order_flow.utils.time import NS_PER_S
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from order_flow.ingestion.events import EventType
 
 DEFAULT_GAP_NS: int = 200_000_000  # 200 ms; @depth@100ms should tick ~every 100 ms
@@ -53,8 +54,7 @@ class CaptureStats:
 
 
 def _kind_bytes(root: Path, event_type: EventType, exchange: str, symbol: str) -> int:
-    kind = PARTITION_DIR[event_type]
-    files = list(Path(root).glob(f"{kind}/exchange={exchange}/symbol={symbol}/date=*/*.parquet"))
+    files = part_files(root, event_type, exchange=exchange, symbol=symbol)
     return sum(path.stat().st_size for path in files)
 
 

@@ -124,12 +124,37 @@ def write_instrument_spec(root: Path, spec: InstrumentSpec) -> Path:
     return path
 
 
-def read_instrument_spec(root: Path) -> InstrumentSpec | None:
-    """Spec recorded with the capture at ``root``, or ``None`` if there is none."""
-    path = Path(root) / INSTRUMENT_FILE
-    if not path.is_file():
-        return None
+def _load(path: Path) -> InstrumentSpec:
     return InstrumentSpec.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def read_instrument_spec(root: Path) -> InstrumentSpec | None:
+    """Spec recorded with the capture at ``root``, or ``None`` if there is none.
+
+    A continuous-capture base (``BASE/SYMBOL`` holding one directory per run) has no spec
+    of its own: the runs' specs are used when they agree.
+
+    Raises:
+        ValueError: The runs recorded different specs (e.g. a tick-size change); one
+            grid cannot replay them together.
+    """
+    root = Path(root)
+    own = root / INSTRUMENT_FILE
+    if own.is_file():
+        return _load(own)
+    if not root.is_dir():
+        return None
+    specs = {
+        run.name: _load(run / INSTRUMENT_FILE)
+        for run in sorted(root.iterdir())
+        if (run / INSTRUMENT_FILE).is_file()
+    }
+    distinct = set(specs.values())
+    if len(distinct) > 1:
+        detail = ", ".join(f"{name}: tick {spec.tick_size}" for name, spec in specs.items())
+        msg = f"instrument specs differ between runs under {root} ({detail})"
+        raise ValueError(msg)
+    return distinct.pop() if distinct else None
 
 
 def resolve_capture_spec(root: Path, symbol: str) -> InstrumentSpec:

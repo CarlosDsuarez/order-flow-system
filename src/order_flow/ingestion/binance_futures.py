@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import math
 import statistics
+import time
 from collections import deque
 from collections.abc import (
     AsyncGenerator,
@@ -37,7 +38,7 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, suppress
 from dataclasses import dataclass, field
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, NoReturn
 
 import httpx
 import orjson
@@ -71,6 +72,17 @@ DEFAULT_REST_URL: Final = "https://fapi.binance.com"
 DEPTH_SNAPSHOT_PATH: Final = "/fapi/v1/depth"
 LATENCY_LOG_EVERY: Final = 200
 MAX_SNAPSHOT_RETRIES: Final = 8
+# A session that synced and stayed up this long resets the reconnect backoff to its
+# initial delay; shorter (flapping) sessions keep backing off towards the cap.
+HEALTHY_SESSION_S: Final = 60.0
+# Ping/pong only proves the TCP path is alive. With no depth frame for this long the
+# stream is treated as half-dead (``@aggTrade`` went silent this way on 2026-09-02).
+STALE_TIMEOUT_S: Final = 30.0
+# Bounded queues: a stalled consumer backpressures the socket (websockets stops reading,
+# the ping times out, the feed reconnects and resyncs) instead of growing RAM unbounded.
+# Nothing is dropped silently.
+RAW_QUEUE_MAXSIZE: Final = 10_000
+EVENT_QUEUE_MAXSIZE: Final = 100_000
 MAX_LATENCY_SAMPLES: Final = 10_000
 HTTP_TOO_MANY_REQUESTS: Final = 429
 HTTP_BAD_REQUEST: Final = 400
@@ -78,6 +90,11 @@ _WS_SENTINEL: Final = object()
 
 # Documented REST weights for GET /fapi/v1/depth (limit → weight).
 DEPTH_LIMIT_WEIGHT: Final[dict[int, int]] = {5: 2, 10: 2, 20: 2, 50: 2, 100: 5, 500: 10, 1000: 20}
+
+
+class StaleFeedError(RuntimeError):
+    """No depth frame within ``stale_timeout_s`` while the socket stayed open."""
+
 
 WsConnect = Callable[[str], AbstractAsyncContextManager[AsyncIterable[str | bytes]]]
 """Factory returning an async context manager that yields an async iterable of raw messages.
@@ -91,20 +108,30 @@ def _default_ws_connect(url: str) -> AbstractAsyncContextManager[AsyncIterable[s
     return connect(url, open_timeout=20.0, ping_interval=20.0, ping_timeout=20.0)
 
 
+async def _pump_frames(messages: AsyncIterator[str | bytes], dest: asyncio.Queue[object]) -> None:
+    """Copy raw frames into ``dest`` and end with :data:`_WS_SENTINEL`.
+
+    On cancellation the sentinel is skipped: ``dest`` is bounded, and a cancelled pump that
+    awaited ``put`` on a full queue would block forever while its owner waits for it.
+    """
+    cancelled = False
+    try:
+        async for raw in messages:
+            await dest.put(raw)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        if not cancelled:
+            await dest.put(_WS_SENTINEL)
+
+
 async def _merge_raw_streams(
     *streams: AsyncIterator[str | bytes],
 ) -> AsyncGenerator[str | bytes, None]:
     """Fair-merge several WebSocket iterators until every one has ended."""
-    incoming: asyncio.Queue[object] = asyncio.Queue()
-
-    async def pump(messages: AsyncIterator[str | bytes]) -> None:
-        try:
-            async for raw in messages:
-                await incoming.put(raw)
-        finally:
-            await incoming.put(_WS_SENTINEL)
-
-    pumps = [asyncio.create_task(pump(stream)) for stream in streams]
+    incoming: asyncio.Queue[object] = asyncio.Queue(maxsize=RAW_QUEUE_MAXSIZE)
+    pumps = [asyncio.create_task(_pump_frames(stream, incoming)) for stream in streams]
     finished = 0
     try:
         while finished < len(pumps):
@@ -133,6 +160,7 @@ __all__ = [
     "BinanceFuturesFeed",
     "DepthSequenceValidator",
     "FeedStats",
+    "StaleFeedError",
     "parse_agg_trade",
     "parse_depth_snapshot",
     "parse_depth_update",
@@ -286,6 +314,8 @@ class FeedStats:
     trades: int = 0
     rest_429s: int = 0
     rest_errors: int = 0
+    stale_disconnects: int = 0
+    queue_high_watermark: int = 0
     latency_samples_ns: list[int] = field(default_factory=list)
 
     def record_latency(self, sample_ns: int) -> None:
@@ -343,6 +373,7 @@ class BinanceFuturesFeed:
         symbol: str,
         *,
         queue: asyncio.Queue[MarketEvent] | None = None,
+        max_queue: int = EVENT_QUEUE_MAXSIZE,
         depth_speed: str = "100ms",
         snapshot_limit: int = 1000,
         include_trades: bool = True,
@@ -351,6 +382,8 @@ class BinanceFuturesFeed:
         rest_url: str = DEFAULT_REST_URL,
         timeout_s: float = 10.0,
         max_snapshot_retries: int = MAX_SNAPSHOT_RETRIES,
+        healthy_session_s: float = HEALTHY_SESSION_S,
+        stale_timeout_s: float = STALE_TIMEOUT_S,
         ws_connect: WsConnect | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -363,9 +396,14 @@ class BinanceFuturesFeed:
         self.rest_url = rest_url
         self.timeout_s = timeout_s
         self.max_snapshot_retries = max_snapshot_retries
+        self.healthy_session_s = healthy_session_s
+        self.stale_timeout_s = stale_timeout_s
+        self._last_depth_mono = 0.0
         self._ws_connect: WsConnect = _default_ws_connect if ws_connect is None else ws_connect
         self._http_client = http_client
-        self.queue: asyncio.Queue[MarketEvent] = asyncio.Queue() if queue is None else queue
+        self.queue: asyncio.Queue[MarketEvent] = (
+            asyncio.Queue(maxsize=max_queue) if queue is None else queue
+        )
         self.stats = FeedStats()
         self._book = OrderBook(exchange=EXCHANGE, symbol=self.symbol)
         self._sync = DepthSynchronizer()
@@ -506,9 +544,11 @@ class BinanceFuturesFeed:
     async def _run_forever(self) -> None:
         attempt = 0
         while True:
+            started = time.monotonic()
+            synced = False
             try:
                 async for _event in self.stream():
-                    pass
+                    synced = True
                 close_reason = "eof"
                 close_code: int | None = None
             except asyncio.CancelledError:
@@ -522,6 +562,8 @@ class BinanceFuturesFeed:
                 log.error("ws_session_error", symbol=self.symbol, error=str(exc))
             self._sync.on_disconnect()
             self._book.mark_unsynced()
+            if synced and time.monotonic() - started >= self.healthy_session_s:
+                attempt = 0
             delay = reconnect_delay(attempt)
             self.stats.reconnects += 1
             log.warning(
@@ -580,8 +622,8 @@ class BinanceFuturesFeed:
         On ``pu != previous u``: never apply the gap event; count it; fetch a new snapshot
         while the socket stays up. Official step 6: "initialize the process from step 3".
         """
-        incoming: asyncio.Queue[object] = asyncio.Queue()
-        pump = asyncio.create_task(self._pump(messages, incoming), name=f"ws-pump-{self.symbol}")
+        incoming: asyncio.Queue[object] = asyncio.Queue(maxsize=RAW_QUEUE_MAXSIZE)
+        pump = asyncio.create_task(_pump_frames(messages, incoming), name=f"ws-pump-{self.symbol}")
         pending: deque[object] = deque()
         try:
             while not self._stopped:
@@ -596,12 +638,13 @@ class BinanceFuturesFeed:
                     last_update_id=snapshot.last_update_id,
                 )
                 self._note_latency(snapshot)
-                await self.queue.put(snapshot)
+                self._last_depth_mono = time.monotonic()
+                await self._publish(snapshot)
                 yield snapshot
                 ended = False
                 while not self._stopped:
                     if not pending:
-                        pending.append(await incoming.get())
+                        pending.append(await self._next_raw(incoming))
                     raw = pending.popleft()
                     if raw is _WS_SENTINEL:
                         ended = True
@@ -613,7 +656,7 @@ class BinanceFuturesFeed:
                         self._drain_nowait(incoming, pending)
                         break
                     if outcome is not None:
-                        await self.queue.put(outcome)
+                        await self._publish(outcome)
                         yield outcome
                 if ended:
                     return
@@ -622,16 +665,38 @@ class BinanceFuturesFeed:
             with suppress(asyncio.CancelledError):
                 await pump
 
-    async def _pump(
-        self, messages: AsyncIterator[str | bytes], dest: asyncio.Queue[object]
-    ) -> None:
+    async def _publish(self, event: MarketEvent) -> None:
+        """Put ``event`` on :attr:`queue` (blocks while full) and track its high-watermark."""
+        await self.queue.put(event)
+        self.stats.queue_high_watermark = max(self.stats.queue_high_watermark, self.queue.qsize())
+
+    async def _next_raw(self, incoming: asyncio.Queue[object]) -> object:
+        """Next raw frame; raise :class:`StaleFeedError` once depth has been silent too long."""
+        with suppress(asyncio.QueueEmpty):
+            return incoming.get_nowait()
+        remaining = self.stale_timeout_s - self._depth_silence_s()
+        # ``asyncio.timeout``, not ``wait_for``: on 3.11 ``wait_for`` swallows a cancel that
+        # lands as ``get()`` completes, and ``stop()`` would then never return.
         try:
-            async for raw in messages:
-                await dest.put(raw)
-        except ConnectionClosed:
-            raise
-        finally:
-            await dest.put(_WS_SENTINEL)
+            async with asyncio.timeout(max(remaining, 0.0)):
+                return await incoming.get()
+        except TimeoutError:
+            self._raise_stale()
+
+    def _depth_silence_s(self) -> float:
+        return time.monotonic() - self._last_depth_mono
+
+    def _raise_stale(self) -> NoReturn:
+        self.stats.stale_disconnects += 1
+        self._book.mark_unsynced()
+        log.warning(
+            "depth_stale",
+            symbol=self.symbol,
+            silent_s=round(self._depth_silence_s(), 3),
+            timeout_s=self.stale_timeout_s,
+        )
+        msg = f"no depth update for {self.symbol} in {self.stale_timeout_s} s"
+        raise StaleFeedError(msg)
 
     @staticmethod
     def _drain_nowait(incoming: asyncio.Queue[object], pending: deque[object]) -> None:
@@ -665,6 +730,7 @@ class BinanceFuturesFeed:
         except (ValueError, KeyError, TypeError) as exc:
             log.warning("depth_parse_error", symbol=self.symbol, error=str(exc))
             return None
+        self._last_depth_mono = time.monotonic()
         if self._honesty_freeze:
             # Mundo parado para honesty: bufferizar sin mutar libro/validador/stats.
             self._frozen_deltas.append(delta)

@@ -158,9 +158,7 @@ def test_trade_flags_follow_aggressor_and_qty_zero_is_dropped(tmp_path: Path) ->
     assert len(trades) == 2
     assert feed.n_qty0_trades_dropped == 1
     assert feed.n_trades_in == 3
-    sides = sorted(
-        "buy" if int(row["ev"]) & BUY_EVENT == BUY_EVENT else "sell" for row in trades
-    )
+    sides = sorted("buy" if int(row["ev"]) & BUY_EVENT == BUY_EVENT else "sell" for row in trades)
     assert sides == ["buy", "sell"]
     assert feed.conservation_gap() == 0
 

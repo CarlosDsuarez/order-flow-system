@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
 import pytest
@@ -15,6 +15,8 @@ from order_flow.ingestion.binance_futures import (
     DEFAULT_REST_URL,
     DEFAULT_WS_URL,
     BinanceFuturesFeed,
+    StaleFeedError,
+    WsConnect,
 )
 from order_flow.ingestion.events import BookDelta, BookSnapshot, MarketEvent, PriceLevel, Trade
 
@@ -272,6 +274,189 @@ async def test_start_reconnects_after_socket_eof(monkeypatch: pytest.MonkeyPatch
     assert connects >= 2
     assert isinstance(got[0], BookSnapshot)
     assert feed.book.last_update_id is not None
+
+
+async def _reconnect_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_connect: WsConnect,
+    *,
+    healthy_session_s: float,
+    n: int = 4,
+) -> list[int]:
+    """Run :meth:`BinanceFuturesFeed.start` until ``n`` reconnect delays were requested."""
+    attempts: list[int] = []
+    enough = asyncio.Event()
+
+    def fake_delay(attempt: int, **_kwargs: object) -> float:
+        attempts.append(attempt)
+        if len(attempts) >= n:
+            enough.set()
+        return 0.0
+
+    monkeypatch.setattr("order_flow.ingestion.binance_futures.reconnect_delay", fake_delay)
+    feed = BinanceFuturesFeed(
+        "BTCUSDT",
+        ws_connect=fake_connect,
+        http_client=snapshot_client([100], []),
+        healthy_session_s=healthy_session_s,
+    )
+    await feed.start()
+    await asyncio.wait_for(enough.wait(), timeout=2.0)
+    await feed.stop()
+    return attempts[:n]
+
+
+@asynccontextmanager
+async def _one_synced_delta(_uri: str) -> AsyncIterator[FakeWebSocket]:
+    yield FakeWebSocket([depth(98, 102, 95)])
+
+
+async def test_backoff_resets_after_healthy_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every session syncs and lasts >= 0 s: the next reconnect starts from the initial delay
+    # instead of drifting to the 30 s cap after a handful of daily Binance disconnects.
+    attempts = await _reconnect_attempts(monkeypatch, _one_synced_delta, healthy_session_s=0.0)
+    assert attempts == [0, 0, 0, 0]
+
+
+async def test_backoff_grows_when_sessions_are_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Synced but shorter than the healthy threshold: a flapping link keeps backing off.
+    attempts = await _reconnect_attempts(monkeypatch, _one_synced_delta, healthy_session_s=1e9)
+    assert attempts == [0, 1, 2, 3]
+
+
+async def test_backoff_grows_when_session_never_syncs(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refused(_uri: str) -> NoReturn:
+        raise OSError("connection refused")
+
+    attempts = await _reconnect_attempts(monkeypatch, refused, healthy_session_s=0.0)
+    assert attempts == [0, 1, 2, 3]
+
+
+class SilentAfterWebSocket:
+    """Sends ``messages``, then keeps the socket open; optionally repeats ``keepalive`` forever.
+
+    Models a half-dead stream: TCP/ping stay healthy while Binance stops sending depth.
+    """
+
+    def __init__(self, messages: Sequence[str | bytes], *, keepalive: str | None = None) -> None:
+        self._messages = list(messages)
+        self._keepalive = keepalive
+
+    def __aiter__(self) -> AsyncIterator[str | bytes]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[str | bytes]:
+        for message in self._messages:
+            yield message
+        while True:
+            await asyncio.sleep(0.005)
+            if self._keepalive is not None:
+                yield self._keepalive
+
+
+async def _collect_until_stale(ws: SilentAfterWebSocket) -> BinanceFuturesFeed:
+    @asynccontextmanager
+    async def fake_connect(_uri: str) -> AsyncIterator[SilentAfterWebSocket]:
+        yield ws
+
+    feed = BinanceFuturesFeed(
+        "BTCUSDT",
+        ws_connect=fake_connect,
+        http_client=snapshot_client([100], []),
+        stale_timeout_s=0.05,
+    )
+    with pytest.raises(StaleFeedError):
+        await asyncio.wait_for(collect(feed), timeout=2.0)
+    return feed
+
+
+async def test_stream_raises_when_depth_goes_silent() -> None:
+    feed = await _collect_until_stale(SilentAfterWebSocket([depth(98, 102, 95)]))
+    assert feed.stats.stale_disconnects == 1
+    assert feed.stats.deltas_applied == 1
+
+
+async def test_trades_alone_do_not_keep_a_silent_depth_stream_alive() -> None:
+    feed = await _collect_until_stale(
+        SilentAfterWebSocket([depth(98, 102, 95)], keepalive=TRADE_PRINT_MSG)
+    )
+    assert feed.stats.stale_disconnects == 1
+    assert feed.stats.trades > 0
+
+
+class CountingWebSocket:
+    """Counts frames pulled off the socket; stays open (silent) after the last one."""
+
+    def __init__(self, messages: Sequence[str | bytes]) -> None:
+        self._messages = list(messages)
+        self.pulled = 0
+
+    def __aiter__(self) -> AsyncIterator[str | bytes]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[str | bytes]:
+        for message in self._messages:
+            self.pulled += 1
+            yield message
+        await asyncio.Event().wait()
+
+
+def contiguous_depth(n: int) -> list[str | bytes]:
+    """Delta bracketing snapshot id 100, then ``n`` contiguous deltas (``pu`` chain intact)."""
+    first: list[str | bytes] = [depth(98, 102, 95)]
+    return first + [depth(103 + 2 * i, 104 + 2 * i, 102 + 2 * i) for i in range(n)]
+
+
+def stalled_feed(
+    monkeypatch: pytest.MonkeyPatch, ws: CountingWebSocket, *, dual_sockets: bool = False
+) -> BinanceFuturesFeed:
+    monkeypatch.setattr("order_flow.ingestion.binance_futures.RAW_QUEUE_MAXSIZE", 4)
+
+    @asynccontextmanager
+    async def fake_connect(uri: str) -> AsyncIterator[CountingWebSocket]:
+        yield ws if "@depth" in uri else CountingWebSocket([])
+
+    return BinanceFuturesFeed(
+        "BTCUSDT",
+        dual_sockets=dual_sockets,
+        max_queue=5,
+        ws_connect=fake_connect,
+        http_client=snapshot_client([100], []),
+    )
+
+
+async def test_slow_consumer_backpressures_socket_without_dropping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = contiguous_depth(200)
+    ws = CountingWebSocket(messages)
+    feed = stalled_feed(monkeypatch, ws)
+    await feed.start()
+    await asyncio.sleep(0.1)  # consumer stalled: nothing reads feed.queue
+
+    assert feed.queue.qsize() == 5
+    assert feed.stats.queue_high_watermark == 5
+    assert ws.pulled < len(messages)  # memory bounded: the socket is not drained into RAM
+
+    got = [await asyncio.wait_for(feed.queue.get(), timeout=2.0) for _ in range(202)]
+    await asyncio.wait_for(feed.stop(), timeout=2.0)
+    deltas = [event for event in got if isinstance(event, BookDelta)]
+    assert isinstance(got[0], BookSnapshot)
+    assert [delta.final_update_id for delta in deltas] == [102] + [104 + 2 * i for i in range(200)]
+    assert feed.stats.gaps == 0
+
+
+@pytest.mark.parametrize("dual_sockets", [False, True])
+async def test_stop_does_not_hang_while_queues_are_full(
+    monkeypatch: pytest.MonkeyPatch, dual_sockets: bool
+) -> None:
+    feed = stalled_feed(
+        monkeypatch, CountingWebSocket(contiguous_depth(200)), dual_sockets=dual_sockets
+    )
+    await feed.start()
+    await asyncio.sleep(0.1)
+    assert feed.queue.full()
+    await asyncio.wait_for(feed.stop(), timeout=2.0)
 
 
 async def test_bad_trade_does_not_kill_depth_pipeline() -> None:

@@ -48,6 +48,12 @@ Timestamps: `ts_event_ns` (reloj del exchange; en depth es `E`) y `ts_recv_ns` (
 
 Cualquier rotura de continuidad (`pu != u` previo, primer evento que no bracket-ea el snapshot, o `SequenceGapError` del libro) **obliga** a un snapshot REST nuevo. Nunca se continúa con un libro posiblemente corrupto. Un disconnect WS tira el buffer: no se confía en mensajes a medio vuelo.
 
+Reconexión y salud del feed:
+
+- Backoff exponencial con jitter (0.5 s → 30 s); vuelve a 0.5 s tras una sesión que sincronizó y duró ≥ `healthy_session_s` (60 s). Sin eso, tras unos cuantos cortes de 24 h de Binance cada reconexión esperaba el tope.
+- Watchdog: sin frame `depthUpdate` durante `stale_timeout_s` (30 s) → `StaleFeedError` → reconexión + resync (`stats.stale_disconnects`). El ping WS solo prueba el TCP; los trades no cuentan como vida del depth.
+- Colas acotadas (`max_queue` 100k eventos, 10k frames crudos): un consumidor lento hace backpressure hasta el socket (ping timeout → reconexión → resync). Nunca se descarta en silencio; `stats.queue_high_watermark` registra el pico.
+
 ## Qué no está en esta fase
 
 Bybit, OKX, ClickHouse/QuestDB (extras vacíos), ZeroMQ, ticks enteros, capa de

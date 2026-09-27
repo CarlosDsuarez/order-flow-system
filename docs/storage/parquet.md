@@ -23,6 +23,13 @@ Cada `flush` escribe un archivo `part-NNNNN.parquet` nuevo (no se reabren row gr
 El recorder vacía por recuento (`buffer_size`, default 2000) y por tiempo
 (`--flush-interval`, default 2 s).
 
+Escritura atómica: se escribe `.part-NNNNN.parquet.tmp` y se renombra con `os.replace`;
+un crash a mitad no deja un part truncado que rompa el scan de la partición. `NNNNN` es
+el máximo existente + 1 (borrar un part nunca provoca sobrescritura). El recorder usa
+`auto_flush=False` + `flush_async()`: la escritura corre en un hilo y no bloquea el pump
+WS del mismo event loop. SIGINT/SIGTERM cierran limpio (flush + `capture_meta.json` con
+`interrupted`); una segunda señal fuerza la salida.
+
 El feed **no** escribe disco. `scripts/record_l2.py` se suscribe a `feed.queue`, aplica
 un `OrderBook` local, persiste eventos y toma snapshots periódicos del LOB
 (`--snapshot-interval`, default 1 s).

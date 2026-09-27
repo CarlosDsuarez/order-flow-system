@@ -7,7 +7,7 @@ in ``(ts_event_ns, final_update_id)`` order.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -27,6 +27,93 @@ if TYPE_CHECKING:
 
 class ReconstructionError(Exception):
     """Capture is missing a snapshot at or before ``T``, or replay hit a sequence gap."""
+
+
+@dataclass(frozen=True, slots=True)
+class BookStream:
+    """Book events a replay must apply, in order, plus what was left out."""
+
+    events: tuple[BookSnapshot | BookDelta, ...]
+    n_periodic_skipped: int
+    n_off_chain_deltas: int
+
+
+def _uid(event: BookSnapshot | BookDelta) -> int:
+    return event.last_update_id if isinstance(event, BookSnapshot) else event.final_update_id
+
+
+def _restamp(events: list[BookSnapshot | BookDelta]) -> list[BookSnapshot | BookDelta]:
+    """Pull timestamps back so both clocks strictly increase along the replay order.
+
+    The engines re-sort by time. A REST snapshot's ``E`` / receive time is the response,
+    often later than the diff that follows it in update-id order; it is moved to 1 ns
+    before that diff (the book it describes existed by then). In-order stamps are kept.
+    """
+    out = list(events)
+    next_event = next_recv = None
+    for index in range(len(out) - 1, -1, -1):
+        event = out[index]
+        ts_event, ts_recv = event.ts_event_ns, event.ts_recv_ns
+        if next_event is not None and ts_event >= next_event:
+            ts_event = next_event - 1
+        if next_recv is not None and ts_recv >= next_recv:
+            ts_recv = next_recv - 1
+        if (ts_event, ts_recv) != (event.ts_event_ns, event.ts_recv_ns):
+            out[index] = replace(event, ts_event_ns=ts_event, ts_recv_ns=ts_recv)
+        next_event, next_recv = ts_event, ts_recv
+    return out
+
+
+def book_stream(snapshots: list[BookSnapshot], deltas: list[BookDelta]) -> BookStream:
+    """Order snapshots and deltas for replay, across resyncs, without stale state.
+
+    Walks update ids, not event time: a REST snapshot's ``E`` can be later than the
+    diff that brackets it. At equal ids a delta that continues the chain goes first
+    and the snapshot is a periodic copy of that book (skipped); a delta that does not
+    continue it follows a REST resync snapshot, which goes first (the diff may carry
+    levels deeper than the REST depth). After a delta that breaks the chain, deltas
+    are dropped until the next snapshot. Timestamps are then made monotonic
+    (:func:`_restamp`).
+    """
+    ordered: list[BookSnapshot | BookDelta] = sorted(
+        [*deltas, *snapshots], key=lambda e: (_uid(e), isinstance(e, BookSnapshot))
+    )
+    kept: list[BookSnapshot | BookDelta] = []
+    periodic = off_chain = 0
+    last_u: int | None = None
+    bracketing = False
+    index = 0
+    while index < len(ordered):
+        event = ordered[index]
+        index += 1
+        if isinstance(event, BookSnapshot):
+            if event.last_update_id == last_u:
+                periodic += 1
+                continue
+            kept.append(event)
+            last_u, bracketing = event.last_update_id, True
+            continue
+        # Same rule as OrderBook.apply_delta: ``pu`` continues the chain, or the first
+        # delta after a snapshot brackets its id (futures protocol).
+        continues = last_u is not None and (
+            event.prev_final_update_id == last_u
+            or (bracketing and event.first_update_id <= last_u <= event.final_update_id)
+        )
+        if not continues:
+            upcoming = ordered[index] if index < len(ordered) else None
+            if isinstance(upcoming, BookSnapshot) and upcoming.last_update_id == _uid(event):
+                ordered[index - 1], ordered[index] = upcoming, event  # REST first, then diff
+                index -= 1
+                continue
+            # Update ids only grow, so once a delta breaks the chain no later delta can
+            # continue ``last_u``: all are dropped until the next snapshot resets it.
+            off_chain += 1
+            continue
+        kept.append(event)
+        last_u, bracketing = event.final_update_id, False
+    return BookStream(
+        events=tuple(_restamp(kept)), n_periodic_skipped=periodic, n_off_chain_deltas=off_chain
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,38 +257,24 @@ def _has_valid_l1(book: OrderBook) -> bool:
 def _iter_synced_books(
     root: Path, *, exchange: str, symbol: str
 ) -> Iterator[tuple[OrderBook, int, bool]]:
-    """Yield ``(book, epoch, new_epoch)`` after each synced snapshot/delta with valid L1."""
-    snapshots = snapshots_from_frame(
-        read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)
+    """Yield ``(book, epoch, new_epoch)`` after each replayed snapshot/delta with valid L1."""
+    stream = book_stream(
+        snapshots_from_frame(read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)),
+        deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol)),
     )
-    deltas = deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol))
-    merged: list[tuple[int, int, int, BookSnapshot | BookDelta]] = []
-    merged.extend((snap.ts_event_ns, snap.last_update_id, 1, snap) for snap in snapshots)
-    merged.extend((delta.ts_event_ns, delta.final_update_id, 0, delta) for delta in deltas)
-    merged.sort()
     book = OrderBook()
     epoch = 0
     yielded = False
-    for _ts, _uid, _kind, event in merged:
+    for event in stream.events:
         if isinstance(event, BookSnapshot):
-            if book.last_update_id is not None and event.last_update_id == book.last_update_id:
-                continue
             book.apply_snapshot(event)
-            if book.last_update_id is not None and yielded:
+            if yielded:
                 epoch += 1
             if _has_valid_l1(book):
                 yield book, epoch, True
                 yielded = True
             continue
-        if book.last_update_id is None:
-            continue
-        try:
-            applied = book.apply_delta(event)
-        except SequenceGapError:
-            book.mark_unsynced()
-            continue
-        if not applied or not book.is_synced:
-            continue
+        book.apply_delta(event)
         if _has_valid_l1(book):
             yield book, epoch, False
             yielded = True

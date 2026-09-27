@@ -82,6 +82,17 @@ def test_resync_snapshot_stamped_after_its_bracketing_delta_is_not_a_break(
     assert quality.n_epochs == 2
 
 
+def test_delta_continuing_a_snapshot_id_is_not_a_break(tmp_path: Path) -> None:
+    # OrderBook.apply_delta accepts pu == lastUpdateId right after a snapshot, not only
+    # a bracketing first delta; the checker must agree with the replay.
+    rest = make_snapshot(last_update_id=300, ts_event_ns=T0_NS + 5 * NS)
+    follows = make_delta(301, 305, 300, bids=((100.0, 1.0),), ts_event_ns=T0_NS + 6 * NS)
+    record(tmp_path, [*clean_tape(), rest, follows])
+    quality = check_capture(tmp_path, exchange=EXCHANGE, symbol=SYMBOL)
+    assert quality.ok, quality.issues
+    assert quality.n_epochs == 2
+
+
 def test_missing_delta_without_resync_is_a_chain_break(tmp_path: Path) -> None:
     orphan = make_delta(120, 125, 118, bids=((100.0, 3.0),), ts_event_ns=T0_NS + 5 * NS)
     record(tmp_path, [*clean_tape(), orphan])

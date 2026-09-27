@@ -23,7 +23,7 @@ snapshot levels, empty deltas, duplicate/periodic snapshots.
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 import numpy as np
@@ -35,8 +35,10 @@ from order_flow.storage.parquet import (
     snapshots_from_frame,
     trades_from_frame,
 )
+from order_flow.storage.reconstruct import book_stream
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from numpy.typing import NDArray
@@ -90,6 +92,7 @@ class HftFeed:
     n_qty0_trades_dropped: int
     n_qty0_snapshot_levels_dropped: int
     n_empty_deltas_dropped: int
+    n_off_chain_deltas_dropped: int
     n_feed_depth_events: int
     n_feed_trade_events: int
     n_feed_clear_events: int
@@ -105,7 +108,11 @@ class HftFeed:
             self.n_initial_snapshots + self.n_snapshots_skipped + self.n_resync_snapshots
         )
         trades = self.n_trades_in - (self.n_feed_trade_events + self.n_qty0_trades_dropped)
-        deltas = self.n_deltas_in - (self.n_delta_batches_emitted + self.n_empty_deltas_dropped)
+        deltas = self.n_deltas_in - (
+            self.n_delta_batches_emitted
+            + self.n_empty_deltas_dropped
+            + self.n_off_chain_deltas_dropped
+        )
         depth = self.n_delta_levels_in - self.n_feed_depth_events
         initial = self.n_initial_positive_levels - int(self.initial_snapshot.shape[0])
         resync = self.n_resync_positive_levels - self.n_feed_snapshot_events
@@ -160,8 +167,16 @@ def _snapshot_level_rows(snapshot: BookSnapshot, *, kind: int) -> tuple[list[Eve
     return rows, n_positive, n_qty0
 
 
-def _resync_rows(snapshot: BookSnapshot) -> tuple[list[EventRow], int, int, int]:
-    """CLEAR up to the farthest price, then SNAPSHOT levels. Matches Binance converter."""
+def _resync_rows(
+    snapshot: BookSnapshot, reach: dict[bool, float]
+) -> tuple[list[EventRow], int, int, int]:
+    """CLEAR out to the farthest price, then SNAPSHOT levels. Matches Binance converter.
+
+    hftbacktest clears from the touch out to the CLEAR price, so that price must also
+    cover the old book (``reach``, the deepest level seen per side since the last
+    clear): diffs grow the book past the REST snapshot's 1000 levels, and levels
+    beyond the new snapshot's farthest would otherwise survive the resync.
+    """
     rows: list[EventRow] = []
     n_clear = 0
     n_positive = 0
@@ -172,11 +187,10 @@ def _resync_rows(snapshot: BookSnapshot) -> tuple[list[EventRow], int, int, int]
         n_qty0 += qty0
         if not positive:
             continue
-        farthest = (
-            min(level.price for level in positive)
-            if is_bid
-            else max(level.price for level in positive)
-        )
+        prices = [level.price for level in positive]
+        if is_bid in reach:
+            prices.append(reach[is_bid])
+        farthest = min(prices) if is_bid else max(prices)
         rows.append(
             _row(
                 DEPTH_CLEAR_EVENT | _BOTH | _side_flag(is_bid),
@@ -264,6 +278,15 @@ class _BookAcc:
     n_resync_positive: int = 0
     n_clear: int = 0
     n_feed_snap: int = 0
+    #: Deepest price seen per side (True = bids) since the last snapshot.
+    reach: dict[bool, float] = field(default_factory=dict)
+
+    def extend_reach(self, levels: Sequence[PriceLevel], *, is_bid: bool) -> None:
+        prices = [level.price for level in levels if level.qty > 0]
+        if is_bid in self.reach:
+            prices.append(self.reach[is_bid])
+        if prices:
+            self.reach[is_bid] = min(prices) if is_bid else max(prices)
 
 
 def _apply_snapshot(acc: _BookAcc, snapshot: BookSnapshot) -> None:
@@ -274,11 +297,11 @@ def _apply_snapshot(acc: _BookAcc, snapshot: BookSnapshot) -> None:
         acc.n_qty0_snap += n_qty0
         acc.n_initial += 1
         acc.last_id = snapshot.last_update_id
+        acc.reach.clear()
+        acc.extend_reach(snapshot.bids, is_bid=True)
+        acc.extend_reach(snapshot.asks, is_bid=False)
         return
-    if snapshot.last_update_id == acc.last_id:
-        acc.n_skipped += 1
-        return
-    rows, n_c, n_pos, n_qty0 = _resync_rows(snapshot)
+    rows, n_c, n_pos, n_qty0 = _resync_rows(snapshot, acc.reach)
     acc.feed_rows.extend(rows)
     acc.n_clear += n_c
     acc.n_feed_snap += n_pos
@@ -286,6 +309,9 @@ def _apply_snapshot(acc: _BookAcc, snapshot: BookSnapshot) -> None:
     acc.n_qty0_snap += n_qty0
     acc.n_resync += 1
     acc.last_id = snapshot.last_update_id
+    acc.reach.clear()
+    acc.extend_reach(snapshot.bids, is_bid=True)
+    acc.extend_reach(snapshot.asks, is_bid=False)
 
 
 def _apply_delta(acc: _BookAcc, delta: BookDelta) -> None:
@@ -297,6 +323,8 @@ def _apply_delta(acc: _BookAcc, delta: BookDelta) -> None:
         return
     acc.feed_rows.extend(_delta_rows(delta))
     acc.n_delta_batches += 1
+    acc.extend_reach(delta.bids, is_bid=True)
+    acc.extend_reach(delta.asks, is_bid=False)
 
 
 def _append_trades(feed_rows: list[EventRow], trades: list[Trade]) -> tuple[int, int]:
@@ -319,8 +347,9 @@ def capture_to_hft_feed(
 ) -> HftFeed:
     """Load a hive capture and emit hftbacktest ``initial_snapshot`` + incremental ``data``.
 
-    Periodic snapshots that repeat the live ``last_update_id`` are skipped so the
-    queue model is not reset every second. Qty-0 trades are dropped (no print).
+    Book events come from :func:`~order_flow.storage.reconstruct.book_stream`: periodic
+    snapshots of an intact chain are skipped so the queue model is not reset every
+    second; a snapshot after a chain break is a resync. Qty-0 trades are dropped.
     """
     snapshots = snapshots_from_frame(
         read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)
@@ -331,13 +360,9 @@ def capture_to_hft_feed(
         msg = "capture has no book snapshots; hftbacktest needs an initial snapshot"
         raise ValueError(msg)
 
-    merged: list[tuple[int, int, int, BookSnapshot | BookDelta]] = []
-    merged.extend((snap.ts_event_ns, snap.last_update_id, 1, snap) for snap in snapshots)
-    merged.extend((delta.ts_event_ns, delta.final_update_id, 0, delta) for delta in deltas)
-    merged.sort()
-
-    acc = _BookAcc(initial_rows=[], feed_rows=[], last_id=None)
-    for _ts, _uid, _kind, event in merged:
+    stream = book_stream(snapshots, deltas)
+    acc = _BookAcc(initial_rows=[], feed_rows=[], last_id=None, n_skipped=stream.n_periodic_skipped)
+    for event in stream.events:
         if isinstance(event, BookSnapshot):
             _apply_snapshot(acc, event)
         else:
@@ -360,6 +385,7 @@ def capture_to_hft_feed(
         n_qty0_trades_dropped=n_qty0_trades,
         n_qty0_snapshot_levels_dropped=acc.n_qty0_snap,
         n_empty_deltas_dropped=acc.n_empty_deltas,
+        n_off_chain_deltas_dropped=stream.n_off_chain_deltas,
         n_feed_depth_events=n_feed_depth,
         n_feed_trade_events=n_trade_events,
         n_feed_clear_events=acc.n_clear,

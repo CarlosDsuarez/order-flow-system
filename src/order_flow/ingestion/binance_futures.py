@@ -112,8 +112,12 @@ WsConnect = Callable[[str], AbstractAsyncContextManager[AsyncIterable[str | byte
 
 
 def _default_ws_connect(url: str) -> AbstractAsyncContextManager[AsyncIterable[str | bytes]]:
-    """Public Binance WS connect. Short handshake timeout so a hung path fails over fast."""
-    return connect(url, open_timeout=20.0, ping_interval=20.0, ping_timeout=20.0)
+    """Public Binance WS connect. Short handshake timeout so a hung path fails over fast.
+
+    ``close_timeout`` 1 s (library default 10 s): closing waits for Binance's close frame,
+    which made every shutdown or reconnect sit idle for up to 10 s.
+    """
+    return connect(url, open_timeout=20.0, ping_interval=20.0, ping_timeout=20.0, close_timeout=1.0)
 
 
 async def _pump_frames(messages: AsyncIterator[str | bytes], dest: asyncio.Queue[object]) -> None:

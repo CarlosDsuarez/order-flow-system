@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Rendered by scripts/install_capture_agent.sh; placeholders: __LABEL__ __REPO__ __SYMBOL__ __BASE__.
+  KeepAlive restarts capture_loop.sh after every 24 h run (and after a crash, at most every
+  ThrottleInterval seconds). ExitTimeOut is the SIGTERM grace before SIGKILL on bootout:
+  the recorder needs ~1 s to flush and write capture_meta.json.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>__REPO__/scripts/capture_loop.sh</string>
+    <string>__SYMBOL__</string>
+    <string>__BASE__</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>__BASE__/__SYMBOL__/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__BASE__/__SYMBOL__/launchd.log</string>
+</dict>
+</plist>

@@ -235,8 +235,12 @@ Parquet: [docs/storage/parquet.md](docs/storage/parquet.md).
   OFI-MM, no un edge. Comparación:
   [docs/backtest/queue_position_comparison.md](docs/backtest/queue_position_comparison.md).
   Limitaciones: [docs/backtest_limitations.md](docs/backtest_limitations.md).
-- **Precios en ticks enteros:** migrar `PriceLevel` y `OrderBook` de `float` a ticks/lotes
-  enteros por instrumento.
+- **Grid por instrumento (hecho):** `InstrumentSpec` (tick, lote, límites) sale de
+  `GET /fapi/v1/exchangeInfo` y `scripts/record_l2.py` lo guarda como `instrument.json`
+  junto al Parquet; nautilus y hftbacktest replayan cada símbolo sobre su propia grid
+  (capturas viejas sin spec = BTCUSDT legacy, tick 0.1 / lote 0.001). Precios y
+  cantidades siguen en `float` en eventos, libro y Parquet: el parseo es determinista y
+  un schema int64 rompería las capturas existentes sin corregir nada medible.
 - **Capa de consulta:** DuckDB sobre los Parquet (extra `analytics`); ClickHouse / QuestDB
   siguen como extras sin implementar.
 - **Más exchanges:** adaptadores Bybit (v5) y OKX; L3 (order-by-order) donde el exchange lo

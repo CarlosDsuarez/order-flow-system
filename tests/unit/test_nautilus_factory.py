@@ -15,12 +15,13 @@ import pytest
 
 from order_flow.backtest.conversion import BookOp, ConvertedDelta, ConvertedOrder, ConvertedTrade
 from order_flow.backtest.nautilus_factory import (
-    btcusdt_perp,
     nautilus_available,
+    perpetual,
     to_order_book_deltas,
     to_trade_tick,
 )
 from order_flow.ingestion.events import Side
+from order_flow.ingestion.instruments import LEGACY_BTCUSDT_SPEC
 
 
 class _FakeDelta:
@@ -30,6 +31,9 @@ class _FakeDelta:
     @classmethod
     def clear(cls, instrument_id: Any, sequence: int, ts_event: int, ts_init: int) -> _FakeDelta:
         return cls("clear", instrument_id, sequence, ts_event, ts_init)
+
+
+BTC_PRECISION = {"price_precision": 1, "size_precision": 3}
 
 
 def _fake_models() -> SimpleNamespace:
@@ -49,7 +53,7 @@ def _fake_models() -> SimpleNamespace:
 
 def test_empty_ops_rejected() -> None:
     with pytest.raises(ValueError, match="non-empty"):
-        to_order_book_deltas([], "ID", models=_fake_models())
+        to_order_book_deltas([], "ID", models=_fake_models(), **BTC_PRECISION)
 
 
 def test_payloadless_non_clear_is_dropped() -> None:
@@ -57,7 +61,7 @@ def test_payloadless_non_clear_is_dropped() -> None:
         ConvertedDelta(action=BookOp.UPDATE, sequence=1, ts_event_ns=1, ts_init_ns=1, order=None),
     ]
     with pytest.raises(ValueError, match="produced no deltas"):
-        to_order_book_deltas(ops, "ID", models=_fake_models())
+        to_order_book_deltas(ops, "ID", models=_fake_models(), **BTC_PRECISION)
 
 
 def test_snapshot_ops_become_clear_then_adds() -> None:
@@ -80,7 +84,9 @@ def test_snapshot_ops_become_clear_then_adds() -> None:
             order=ConvertedOrder(side="ask", price=101.0, size=0.0, order_id=1010),
         ),
     ]
-    batch = to_order_book_deltas(ops, "BTCUSDT-PERP.BINANCE", models=_fake_models())
+    batch = to_order_book_deltas(
+        ops, "BTCUSDT-PERP.BINANCE", models=_fake_models(), **BTC_PRECISION
+    )
     assert batch[0] == "BATCH"
     items = batch[2]
     assert items[0].args[0] == "clear"
@@ -99,8 +105,8 @@ def test_trade_tick_maps_aggressor_buyer_and_seller() -> None:
     sell = ConvertedTrade(
         trade_id=8, price=99.0, qty=0.3, aggressor=Side.SELL, ts_event_ns=3, ts_init_ns=4
     )
-    buy_tick = to_trade_tick(buy, "ID", models=models)
-    sell_tick = to_trade_tick(sell, "ID", models=models)
+    buy_tick = to_trade_tick(buy, "ID", models=models, **BTC_PRECISION)
+    sell_tick = to_trade_tick(sell, "ID", models=models, **BTC_PRECISION)
     assert buy_tick[1][3] == "BUYER"
     assert sell_tick[1][3] == "SELLER"
     assert buy_tick[1][4] == ("TID", "7")
@@ -112,6 +118,7 @@ def test_missing_nautilus_raises_import_error(monkeypatch: pytest.MonkeyPatch) -
         to_order_book_deltas(
             [ConvertedDelta(action=BookOp.CLEAR, sequence=1, ts_event_ns=1, ts_init_ns=1)],
             "ID",
+            **BTC_PRECISION,
         )
     with pytest.raises(ImportError, match="uv sync --extra backtest"):
         to_trade_tick(
@@ -119,9 +126,10 @@ def test_missing_nautilus_raises_import_error(monkeypatch: pytest.MonkeyPatch) -
                 trade_id=1, price=1.0, qty=0.001, aggressor=Side.BUY, ts_event_ns=1, ts_init_ns=1
             ),
             "ID",
+            **BTC_PRECISION,
         )
     with pytest.raises(ImportError, match="uv sync --extra backtest"):
-        btcusdt_perp(maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0004"))
+        perpetual(LEGACY_BTCUSDT_SPEC, maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0004"))
 
 
 def test_nautilus_available_is_bool() -> None:

@@ -15,7 +15,17 @@ from order_flow.backtest.conversion import snapshot_to_ops
 from order_flow.backtest.nautilus_factory import to_order_book_deltas
 from order_flow.ingestion.events import Side
 from order_flow.storage.parquet import ParquetWriter
-from tests.helpers import EXCHANGE, SYMBOL, T0_NS, make_delta, make_snapshot, make_trade
+from tests.helpers import (
+    DOGE,
+    DOGE_LAST_MID,
+    EXCHANGE,
+    SYMBOL,
+    T0_NS,
+    make_delta,
+    make_snapshot,
+    make_trade,
+    write_doge_capture,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -27,6 +37,7 @@ pytestmark = [
 ]
 
 NS = 1_000_000
+BTC_PRECISION = {"price_precision": 1, "size_precision": 3}
 
 
 def test_converted_snapshot_applies_to_nautilus_l2_book() -> None:
@@ -41,7 +52,7 @@ def test_converted_snapshot_applies_to_nautilus_l2_book() -> None:
         asks=((100.1, 0.8),),
         ts_event_ns=T0_NS,
     )
-    batch = to_order_book_deltas(snapshot_to_ops(snap, tick=0.1), iid)
+    batch = to_order_book_deltas(snapshot_to_ops(snap, tick=0.1), iid, **BTC_PRECISION)
     book = OrderBook(iid, BookType.L2_MBP)
     book.apply_deltas(batch)
     assert float(book.best_bid_price()) == pytest.approx(100.0)
@@ -59,9 +70,9 @@ def test_qty_zero_delete_removes_nautilus_level() -> None:
     iid = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
     snap = make_snapshot(last_update_id=1, ts_event_ns=T0_NS)
     book = OrderBook(iid, BookType.L2_MBP)
-    book.apply_deltas(to_order_book_deltas(snapshot_to_ops(snap, tick=0.1), iid))
+    book.apply_deltas(to_order_book_deltas(snapshot_to_ops(snap, tick=0.1), iid, **BTC_PRECISION))
     delta = make_delta(2, 2, 1, bids=((100.0, 0.0),), ts_event_ns=T0_NS + NS)
-    book.apply_deltas(to_order_book_deltas(delta_to_ops(delta, tick=0.1), iid))
+    book.apply_deltas(to_order_book_deltas(delta_to_ops(delta, tick=0.1), iid, **BTC_PRECISION))
     assert book.best_bid_price() is None or float(book.best_bid_price()) == pytest.approx(99.0)
 
 
@@ -96,3 +107,16 @@ def test_engine_smoke_on_synthetic_capture(tmp_path: Path) -> None:
     assert maker.nautilus_version
     cross = run_ofi_mm_backtest(tmp_path, cross_spread=True)
     assert cross.cross_spread is True
+
+
+def test_engine_replays_an_altcoin_on_its_own_grid(tmp_path: Path) -> None:
+    # DOGE trades at 0.12345 with tick 1e-5 and lot 1. On the old hardcoded BTC grid
+    # (price precision 1, size 0.001) the book collapses to 0.1 and one lot is 0.001 DOGE.
+    from order_flow.backtest.runner import run_ofi_mm_backtest
+
+    write_doge_capture(tmp_path)
+    result = run_ofi_mm_backtest(tmp_path, symbol=DOGE)
+    assert result.instrument_id == "DOGEUSDT-PERP.BINANCE"
+    assert (result.tick_size, result.lot_size) == (0.00001, 1.0)
+    assert result.trade_size == 1.0  # defaults to the venue minimum, not 0.001
+    assert result.last_mid == pytest.approx(DOGE_LAST_MID, rel=1e-9)

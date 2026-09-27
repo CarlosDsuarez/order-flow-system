@@ -45,3 +45,18 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: uv run pytest
+
+  backtest-engines:
+    name: pytest backtest engines (nautilus + hftbacktest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --extra backtest --extra hftbacktest
+      # Subset run: conftest drops the coverage gate, the full-suite jobs enforce it.
+      - run: >-
+          uv run pytest tests/unit/test_nautilus_engine.py tests/unit/test_nautilus_factory.py
+          tests/unit/test_hft_engine.py tests/unit/test_hft_adapter.py

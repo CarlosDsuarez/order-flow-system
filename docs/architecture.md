@@ -54,9 +54,23 @@ Reconexión y salud del feed:
 - Watchdog: sin frame `depthUpdate` durante `stale_timeout_s` (30 s) → `StaleFeedError` → reconexión + resync (`stats.stale_disconnects`). El ping WS solo prueba el TCP; los trades no cuentan como vida del depth.
 - Colas acotadas (`max_queue` 100k eventos, 10k frames crudos): un consumidor lento hace backpressure hasta el socket (ping timeout → reconexión → resync). Nunca se descarta en silencio; `stats.queue_high_watermark` registra el pico.
 
+## Instrumentos (alts)
+
+`order_flow.ingestion.instruments.InstrumentSpec` guarda la grid de cada símbolo (tick,
+lote, min/max de precio y cantidad, notional mínimo) tal como la publica
+`GET /fapi/v1/exchangeInfo`. `scripts/record_l2.py` la escribe como `instrument.json` en
+la raíz de la captura, porque Binance cambia ticks con el tiempo. Los backtests la leen
+con `resolve_capture_spec`: sin archivo solo se acepta BTCUSDT (spec legacy idéntica al
+hardcode previo); cualquier otro símbolo sin spec falla en vez de adivinar. El tamaño
+por defecto es `min_qty` del venue. `ofi_threshold` está en unidades base: hay que
+ajustarlo por símbolo (5 BTC no equivale a 5 DOGE).
+
+Backstop de honestidad: BTCUSDT sigue en 0.5 BTC exactos (serie H4 comparable); el resto
+usa notional, `max(|Δqty| * precio) > 40 000 USDT`.
+
 ## Qué no está en esta fase
 
-Bybit, OKX, ClickHouse/QuestDB (extras vacíos), ZeroMQ, ticks enteros, capa de
+Bybit, OKX, ClickHouse/QuestDB (extras vacíos), ZeroMQ, precios int64 en eventos/Parquet, capa de
 órdenes live. `nautilus_trader` (extra `backtest`) y `hftbacktest` 2.4.4 (extra
 `hftbacktest`) sí están como replay. El replay **no** modela latencia de red ni
 la cola L3 de Binance; hftbacktest estima cola L2 con ProbQueue. Ver

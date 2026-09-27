@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from order_flow.ingestion.events import BookDelta, BookSnapshot, PriceLevel, Side, Trade
+from order_flow.ingestion.instruments import InstrumentSpec, write_instrument_spec
+from order_flow.storage.parquet import ParquetWriter
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 EXCHANGE = "binance_futures"
 SYMBOL = "BTCUSDT"
@@ -84,3 +91,64 @@ def make_trade(
         qty=qty,
         aggressor=aggressor,
     )
+
+
+DOGE = "DOGEUSDT"
+#: Mid of :func:`write_doge_capture` once both deltas are applied.
+DOGE_LAST_MID = (0.12345 + 0.12346) / 2
+
+
+def doge_spec() -> InstrumentSpec:
+    """DOGEUSDT grid from ``GET /fapi/v1/exchangeInfo`` (2026-09-26): tick 1e-5, lot 1."""
+    return InstrumentSpec(
+        exchange=EXCHANGE,
+        symbol=DOGE,
+        base_asset="DOGE",
+        quote_asset="USDT",
+        tick_size=Decimal("0.000010"),
+        lot_size=Decimal("1"),
+        min_price=Decimal("0.002440"),
+        max_price=Decimal("30"),
+        min_qty=Decimal("1"),
+        max_qty=Decimal("300000000"),
+        min_notional=Decimal("5"),
+    )
+
+
+def write_doge_capture(root: Path) -> None:
+    """Tiny DOGEUSDT tape (sub-cent prices, qty in thousands) plus its ``instrument.json``."""
+    with ParquetWriter(root, EXCHANGE, DOGE) as writer:
+        writer.write(
+            [
+                make_snapshot(
+                    last_update_id=100,
+                    bids=((0.12344, 50_000.0), (0.12343, 80_000.0)),
+                    asks=((0.12347, 40_000.0), (0.12348, 90_000.0)),
+                    ts_event_ns=T0_NS,
+                    symbol=DOGE,
+                ),
+                make_delta(
+                    101,
+                    105,
+                    100,
+                    bids=((0.12345, 12_000.0),),
+                    ts_event_ns=T0_NS + NS_PER_MS,
+                    symbol=DOGE,
+                ),
+                make_trade(
+                    1, 0.12345, 1_000.0, Side.SELL, ts_event_ns=T0_NS + 2 * NS_PER_MS, symbol=DOGE
+                ),
+                make_trade(
+                    2, 0.12347, 2_000.0, Side.BUY, ts_event_ns=T0_NS + 3 * NS_PER_MS, symbol=DOGE
+                ),
+                make_delta(
+                    106,
+                    110,
+                    105,
+                    asks=((0.12346, 4_000.0),),
+                    ts_event_ns=T0_NS + 4 * NS_PER_MS,
+                    symbol=DOGE,
+                ),
+            ]
+        )
+    write_instrument_spec(root, doge_spec())

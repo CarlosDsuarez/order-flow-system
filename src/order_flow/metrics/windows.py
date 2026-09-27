@@ -25,7 +25,9 @@ class TimeWindowSums:
     """Sums of ``values`` on a uniform time grid.
 
     ``valid`` is False when more than one epoch contributed to the window (a resync
-    crossed the bar). Empty windows are valid with ``values == 0`` and ``counts == 0``.
+    crossed the bar), or when an empty window sits between two epochs (a gap: joined
+    capture runs, a reconnect, a sleeping machine). Empty windows inside one epoch are
+    valid with ``values == 0`` and ``counts == 0``.
     """
 
     start_ns: npt.NDArray[np.int64]
@@ -38,6 +40,25 @@ def _window_index(
     ts_ns: npt.NDArray[np.int64], window_ns: int, origin_ns: int
 ) -> npt.NDArray[np.int64]:
     return (ts_ns - origin_ns) // window_ns
+
+
+def _between_epochs(
+    counts: npt.NDArray[np.int64],
+    min_ep: npt.NDArray[np.int64],
+    max_ep: npt.NDArray[np.int64],
+) -> npt.NDArray[np.bool_]:
+    """Empty bars whose previous and next events belong to different epochs.
+
+    Missing data, not "no change": as valid zeros, the hours between joined runs would
+    outnumber real bars and drive the OLS towards the origin. The first and last bars
+    always hold events, so both fills are defined.
+    """
+    bars = np.arange(counts.size)
+    filled = counts > 0
+    prev_bar = np.maximum.accumulate(np.where(filled, bars, 0))
+    next_bar = np.minimum.accumulate(np.where(filled, bars, counts.size - 1)[::-1])[::-1]
+    result: npt.NDArray[np.bool_] = ~filled & (max_ep[prev_bar] != min_ep[next_bar])
+    return result
 
 
 def sum_in_time_windows(
@@ -91,6 +112,7 @@ def sum_in_time_windows(
         np.maximum.at(max_ep, relative, ep)
         mixed = (counts > 0) & (min_ep != max_ep)
         valid &= ~mixed
+        valid &= ~_between_epochs(counts, min_ep, max_ep)
     starts = origin + (first + np.arange(n_bars, dtype=np.int64)) * window_ns
     return TimeWindowSums(
         np.asarray(starts, dtype=np.int64),

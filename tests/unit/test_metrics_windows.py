@@ -161,3 +161,19 @@ def test_ofi_time_windows_marks_mixed_epoch_bar_invalid() -> None:
     )
     assert frame.start_ns.shape == (1,)
     assert not frame.valid[0]
+
+
+def test_empty_windows_between_epochs_are_gaps_not_zero_observations() -> None:
+    # Joining capture runs (or a Mac that slept) leaves hours between epochs. Those
+    # empty bars are missing data; as valid zeros they would swamp the OLS of H1.
+    second = 1_000_000_000
+    ts = [0, second // 2, 10 * second, 10 * second + second // 2]
+    bars = sum_in_time_windows(ts, [1.0, 2.0, 3.0, 4.0], second, epoch=[0, 0, 1, 1])
+    assert bars.counts.tolist() == [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]
+    assert bars.valid.tolist() == [True] + [False] * 9 + [True]
+
+
+def test_empty_windows_inside_one_epoch_stay_valid() -> None:
+    second = 1_000_000_000
+    bars = sum_in_time_windows([0, 3 * second], [1.0, 1.0], second, epoch=[4, 4])
+    assert bars.valid.tolist() == [True, True, True, True]

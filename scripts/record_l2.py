@@ -16,7 +16,7 @@ import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import orjson
@@ -38,6 +38,10 @@ from order_flow.storage.parquet import ParquetWriter, read_events, snapshots_fro
 from order_flow.storage.reconstruct import reconstruct_book
 from order_flow.storage.report import capture_stats, format_capture_report
 from order_flow.utils.logging import configure_logging, get_logger
+from order_flow.utils.shutdown import install_shutdown_handlers
+
+if TYPE_CHECKING:
+    import signal
 
 log = get_logger(__name__)
 
@@ -365,13 +369,27 @@ async def _record(
     writer: ParquetWriter | None = None
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
-        writer = ParquetWriter(out, EXCHANGE, feed.symbol, buffer_size=buffer_size)
+        # auto_flush=False: flushes are awaited below and run in a worker thread, so a
+        # disk write never stalls the WebSocket pump sharing this event loop.
+        writer = ParquetWriter(
+            out, EXCHANGE, feed.symbol, buffer_size=buffer_size, auto_flush=False
+        )
     n_snap = n_delta = n_trade = n_periodic = 0
     honesty: dict[str, Any] | None = None
     started = time.monotonic()
     error: str | None = None
     probe_stop = asyncio.Event()
     probe_task: asyncio.Task[None] | None = None
+    shutdown = asyncio.Event()
+    interrupted: str | None = None
+
+    def on_signal(sig: signal.Signals) -> None:
+        nonlocal interrupted
+        interrupted = sig.name
+        log.warning("shutdown_requested", signal=sig.name)
+        shutdown.set()
+
+    remove_handlers = install_shutdown_handlers(on_signal)
     try:
         await feed.start()
         if rest_probe_every > 0 and out is not None:
@@ -389,7 +407,7 @@ async def _record(
         deadline = loop.time() + seconds
         next_snap = loop.time() + snapshot_interval if snapshot_interval > 0 else float("inf")
         next_flush = loop.time() + flush_interval if flush_interval > 0 else float("inf")
-        while loop.time() < deadline:
+        while loop.time() < deadline and not shutdown.is_set():
             event: MarketEvent | None
             try:
                 event = feed.queue.get_nowait()
@@ -417,10 +435,12 @@ async def _record(
                     n_periodic += 1
                 if snapshot_interval > 0:
                     next_snap = now + snapshot_interval
-            if writer is not None and now >= next_flush:
-                writer.flush()
+            if writer is not None and (now >= next_flush or writer.pending >= buffer_size):
+                await writer.flush_async()
                 next_flush = now + flush_interval
-        if writer is not None and book.is_synced:
+        # A signalled shutdown skips the REST honesty check: exit fast, before a
+        # supervisor's kill timeout, with the Parquet already flushed.
+        if writer is not None and book.is_synced and not shutdown.is_set():
             honesty = await _honesty_vs_rest(feed, book, levels=honesty_levels)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -451,6 +471,7 @@ async def _record(
         await feed.stop()
         if writer is not None:
             writer.close()
+        remove_handlers()
     elapsed = time.monotonic() - started
     print(
         f"symbol={feed.symbol} snapshots={n_snap} periodic={n_periodic} "
@@ -472,6 +493,9 @@ async def _record(
         "gaps": feed.stats.gaps,
         "resyncs": feed.stats.resyncs,
         "reconnects": feed.stats.reconnects,
+        "stale_disconnects": feed.stats.stale_disconnects,
+        "queue_high_watermark": feed.stats.queue_high_watermark,
+        "interrupted": interrupted,
         "latency_ns": feed.stats.latency_summary(),
         "dual_sockets": feed.dual_sockets,
         "honesty": honesty,

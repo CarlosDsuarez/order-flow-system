@@ -30,7 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--taker-fee", type=float, default=0.0004)
     parser.add_argument("--spread-ticks", type=int, default=2)
     parser.add_argument("--ofi-threshold", type=float, default=5.0)
-    parser.add_argument("--trade-size", type=float, default=0.001)
+    parser.add_argument(
+        "--trade-size",
+        type=float,
+        default=None,
+        help="Base units per side (default: the venue minimum from instrument.json)",
+    )
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     parser.add_argument(
         "--skip-cross",
@@ -105,7 +110,8 @@ def render_markdown(maker: BacktestResult, crossing: BacktestResult | None) -> s
             "",
             f"- Directorio: `{maker.capture}`",
             f"- Exchange / símbolo: `{maker.exchange}` / `{maker.symbol}`",
-            f"- Instrumento nautilus: `{maker.instrument_id}` (tick 0.1, size 0.001)",
+            f"- Instrumento nautilus: `{maker.instrument_id}` "
+            f"(tick {maker.tick_size:g}, lote {maker.lot_size:g})",
             f"- Duración de la serie (min-max `ts_event`): **{duration_s:.1f} s** "
             f"(~{duration_min:.1f} min)",
             f"- Batches de libro: {maker.n_book_batches}; trades públicos: {maker.n_public_trades}",
@@ -115,7 +121,8 @@ def render_markdown(maker: BacktestResult, crossing: BacktestResult | None) -> s
             f"±{maker.max_skew} tick si `|OFI_1s| > {maker.ofi_threshold}`",
             f"- OFI: suma móvil de `e_n` (Cont et al., `OfiAccumulator`) en "
             f"{maker.ofi_window_ns / 1e9:.0f} s",
-            f"- Tamaño: {maker.trade_size} BTC por lado; post-only GTC salvo crossing",
+            f"- Tamaño: {maker.trade_size:g} (unidades base) por lado; post-only GTC salvo "
+            "crossing",
             f"- Capital inicial: {maker.starting_balance:.0f} USDT, apalancamiento 1x, "
             "sin modelo de latencia ni liquidación",
             "",

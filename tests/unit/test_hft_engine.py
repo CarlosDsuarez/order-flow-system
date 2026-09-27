@@ -14,7 +14,17 @@ import pytest
 from order_flow.backtest.hft_adapter import capture_to_hft_feed
 from order_flow.ingestion.events import Side
 from order_flow.storage.parquet import ParquetWriter
-from tests.helpers import EXCHANGE, SYMBOL, T0_NS, make_delta, make_snapshot, make_trade
+from tests.helpers import (
+    DOGE,
+    DOGE_LAST_MID,
+    EXCHANGE,
+    SYMBOL,
+    T0_NS,
+    make_delta,
+    make_snapshot,
+    make_trade,
+    write_doge_capture,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -80,3 +90,16 @@ def test_engine_smoke_on_synthetic_capture(tmp_path: Path) -> None:
     assert maker.cross_spread is False
     cross = run_ofi_mm_hftbacktest(tmp_path, cross_spread=True)
     assert cross.cross_spread is True
+
+
+@pytest.mark.hftbacktest
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_engine_replays_an_altcoin_on_its_own_grid(tmp_path: Path) -> None:
+    from order_flow.backtest.hft_runner import run_ofi_mm_hftbacktest
+
+    write_doge_capture(tmp_path)
+    result = run_ofi_mm_hftbacktest(tmp_path, symbol=DOGE)
+    assert (result.tick_size, result.lot_size) == (0.00001, 1.0)
+    assert result.trade_size == 1.0
+    assert result.last_mid == pytest.approx(DOGE_LAST_MID, rel=1e-9)

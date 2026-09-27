@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from order_flow.ingestion.live import (
     HONESTY_MAX_SLACK_BATCHES,
     HONESTY_MISMATCH_WARN,
+    MAX_HONESTY_NOTIONAL_DISCREPANCY,
     MAX_HONESTY_QTY_DISCREPANCY_BTC,
     _conclusion,
     format_live_report_md,
@@ -204,6 +205,39 @@ def test_verdict_fail_qty_discrepancy() -> None:
     text = _conclusion(_base_report(honesty=honesty))
     assert text.startswith("Veredicto: FAIL")
     assert "2.525" in text
+
+
+def _alt_mismatch(qty_diff: float, price: float) -> dict[str, Any]:
+    """One DOGE-sized level mismatch (2/40 = 5 %, under the rate gate)."""
+    return _base_honesty(
+        mismatches=2,
+        matches=38,
+        max_qty_discrepancy=qty_diff,
+        mismatch_details=[
+            {
+                "side": "bid",
+                "price": price,
+                "qty_local": 1_000_000.0,
+                "qty_rest": 1_000_000.0 + qty_diff,
+                "abs_diff": qty_diff,
+            }
+        ],
+    )
+
+
+def test_verdict_alt_qty_noise_is_judged_in_notional() -> None:
+    # 5 000 DOGE at 0.2 USDT is 1 000 USDT: noise, not a corrupt book. The BTC-sized
+    # 0.5 backstop would call it a FAIL.
+    report = _base_report(symbol="DOGEUSDT", honesty=_alt_mismatch(5_000.0, 0.2))
+    assert _conclusion(report).startswith("Veredicto: PASS")
+
+
+def test_verdict_alt_fails_on_large_notional_discrepancy() -> None:
+    report = _base_report(symbol="DOGEUSDT", honesty=_alt_mismatch(300_000.0, 0.2))
+    text = _conclusion(report)
+    assert text.startswith("Veredicto: FAIL")
+    assert "USDT" in text
+    assert str(MAX_HONESTY_NOTIONAL_DISCREPANCY) in text.replace(",", "")
 
 
 def test_verdict_fail_slack_exceeded() -> None:

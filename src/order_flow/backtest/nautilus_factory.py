@@ -17,12 +17,19 @@ from order_flow.ingestion.events import Side
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-INSTRUMENT_ID = "BTCUSDT-PERP.BINANCE"
+    from order_flow.ingestion.instruments import InstrumentSpec
+
 VENUE = "BINANCE"
-PRICE_PRECISION = 1
-SIZE_PRECISION = 3
-TICK_SIZE = "0.1"
-SIZE_INCREMENT = "0.001"
+
+
+def instrument_id_for(spec: InstrumentSpec) -> str:
+    """``<SYMBOL>-PERP.BINANCE``."""
+    return f"{spec.symbol}-PERP.{VENUE}"
+
+
+def _fixed(value: Decimal) -> str:
+    """Shortest fixed-point string (``0.000010`` -> ``0.00001``) for ``from_str``."""
+    return format(value.normalize(), "f")
 
 
 def nautilus_available() -> bool:
@@ -57,18 +64,20 @@ def _load_models() -> Any:  # pragma: no cover - executed only with --extra back
     )
 
 
-def btcusdt_perp(
+def perpetual(
+    spec: InstrumentSpec,
     *,
     maker_fee: Decimal,
     taker_fee: Decimal,
     ts_event: int = 0,
     ts_init: int = 0,
 ) -> Any:
-    """Linear USDT-margined BTC perpetual (tick 0.1, size 0.001) for venue BINANCE."""
+    """Linear USDT-margined perpetual on ``spec``'s tick / lot grid for venue BINANCE."""
     if not nautilus_available():
         msg = "nautilus_trader is required: uv sync --extra backtest"
         raise ImportError(msg)
-    return _load_btcusdt_perp(
+    return _load_perpetual(
+        spec,
         maker_fee=maker_fee,
         taker_fee=taker_fee,
         ts_event=ts_event,
@@ -76,35 +85,39 @@ def btcusdt_perp(
     )
 
 
-def _load_btcusdt_perp(
+def _load_perpetual(
+    spec: InstrumentSpec,
     *,
     maker_fee: Decimal,
     taker_fee: Decimal,
     ts_event: int,
     ts_init: int,
 ) -> Any:  # pragma: no cover - executed only with --extra backtest
-    from nautilus_trader.model.currencies import BTC, USDT
     from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
     from nautilus_trader.model.instruments import CryptoPerpetual
-    from nautilus_trader.model.objects import Money, Price, Quantity
+    from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 
+    # Unknown codes (DOGE, 1000PEPE, ...) become crypto currencies with precision 8.
+    base = Currency.from_str(spec.base_asset, strict=False)
+    quote = Currency.from_str(spec.quote_asset, strict=False)
+    price_prec, size_prec = spec.price_precision, spec.size_precision
     return CryptoPerpetual(
-        instrument_id=InstrumentId(symbol=Symbol("BTCUSDT-PERP"), venue=Venue(VENUE)),
-        raw_symbol=Symbol("BTCUSDT"),
-        base_currency=BTC,
-        quote_currency=USDT,
-        settlement_currency=USDT,
+        instrument_id=InstrumentId(symbol=Symbol(f"{spec.symbol}-PERP"), venue=Venue(VENUE)),
+        raw_symbol=Symbol(spec.symbol),
+        base_currency=base,
+        quote_currency=quote,
+        settlement_currency=quote,
         is_inverse=False,
-        price_precision=PRICE_PRECISION,
-        size_precision=SIZE_PRECISION,
-        price_increment=Price.from_str(TICK_SIZE),
-        size_increment=Quantity.from_str(SIZE_INCREMENT),
-        max_quantity=Quantity.from_str("1000.000"),
-        min_quantity=Quantity.from_str(SIZE_INCREMENT),
+        price_precision=price_prec,
+        size_precision=size_prec,
+        price_increment=Price.from_str(_fixed(spec.tick_size)),
+        size_increment=Quantity.from_str(_fixed(spec.lot_size)),
+        max_quantity=Quantity(float(spec.max_qty), size_prec),
+        min_quantity=Quantity(float(spec.min_qty), size_prec),
         max_notional=None,
-        min_notional=Money(10.00, USDT),
-        max_price=Price.from_str("1000000.0"),
-        min_price=Price.from_str("0.1"),
+        min_notional=Money(float(spec.min_notional), quote),
+        max_price=Price(float(spec.max_price), price_prec),
+        min_price=Price(float(spec.min_price), price_prec),
         margin_init=Decimal("0.05"),
         margin_maint=Decimal("0.025"),
         maker_fee=maker_fee,
@@ -118,8 +131,8 @@ def to_order_book_deltas(
     ops: Sequence[ConvertedDelta],
     instrument_id: Any,
     *,
-    price_precision: int = PRICE_PRECISION,
-    size_precision: int = SIZE_PRECISION,
+    price_precision: int,
+    size_precision: int,
     models: Any | None = None,
 ) -> Any:
     """Materialize one nautilus ``OrderBookDeltas`` batch from converted ops."""
@@ -170,8 +183,8 @@ def to_trade_tick(
     trade: ConvertedTrade,
     instrument_id: Any,
     *,
-    price_precision: int = PRICE_PRECISION,
-    size_precision: int = SIZE_PRECISION,
+    price_precision: int,
+    size_precision: int,
     models: Any | None = None,
 ) -> Any:
     """Materialize one nautilus ``TradeTick``."""

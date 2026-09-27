@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import statistics
 import time
 from collections import deque
 from collections.abc import (
@@ -38,9 +37,11 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, suppress
 from dataclasses import dataclass, field
-from typing import Any, Final, Literal, NoReturn
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn
 
 import httpx
+import numpy as np
 import orjson
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -53,6 +54,7 @@ from order_flow.ingestion.events import (
     Side,
     Trade,
 )
+from order_flow.ingestion.instruments import InstrumentSpec
 from order_flow.ingestion.sync import (
     DepthDecision,
     DepthSequenceValidator,
@@ -65,11 +67,16 @@ from order_flow.orderbook.errors import SequenceGapError
 from order_flow.utils.logging import get_logger
 from order_flow.utils.time import ms_to_ns, now_ns
 
+if TYPE_CHECKING:
+    import numpy.typing as npt
+
 EXCHANGE: Final = "binance_futures"
 DEFAULT_WS_URL: Final = "wss://fstream.binance.com/stream"
 DEFAULT_RAW_WS_URL: Final = "wss://fstream.binance.com/ws"
 DEFAULT_REST_URL: Final = "https://fapi.binance.com"
 DEPTH_SNAPSHOT_PATH: Final = "/fapi/v1/depth"
+# All symbols in one response (the futures endpoint has no ``symbol`` filter); weight 1.
+EXCHANGE_INFO_PATH: Final = "/fapi/v1/exchangeInfo"
 LATENCY_LOG_EVERY: Final = 200
 MAX_SNAPSHOT_RETRIES: Final = 8
 # A session that synced and stayed up this long resets the reconnect backoff to its
@@ -83,7 +90,8 @@ STALE_TIMEOUT_S: Final = 30.0
 # Nothing is dropped silently.
 RAW_QUEUE_MAXSIZE: Final = 10_000
 EVENT_QUEUE_MAXSIZE: Final = 100_000
-MAX_LATENCY_SAMPLES: Final = 10_000
+LATENCY_BUCKET_NS: Final = 1_000_000
+LATENCY_RANGE_NS: Final = 60_000_000_000
 HTTP_TOO_MANY_REQUESTS: Final = 429
 HTTP_BAD_REQUEST: Final = 400
 _WS_SENTINEL: Final = object()
@@ -157,6 +165,7 @@ __all__ = [
     "DEFAULT_WS_URL",
     "DEPTH_SNAPSHOT_PATH",
     "EXCHANGE",
+    "EXCHANGE_INFO_PATH",
     "BinanceFuturesFeed",
     "DepthSequenceValidator",
     "FeedStats",
@@ -164,6 +173,7 @@ __all__ = [
     "parse_agg_trade",
     "parse_depth_snapshot",
     "parse_depth_update",
+    "parse_exchange_info",
     "parse_trade",
     "unwrap_stream_message",
 ]
@@ -288,23 +298,80 @@ def parse_depth_snapshot(
     )
 
 
+def parse_exchange_info(payload: Mapping[str, Any], symbol: str) -> InstrumentSpec:
+    """Grid of ``symbol`` from ``GET /fapi/v1/exchangeInfo``.
+
+    ``PRICE_FILTER`` gives tick and price bounds, ``LOT_SIZE`` (limit orders, not
+    ``MARKET_LOT_SIZE``) the lot and quantity bounds, ``MIN_NOTIONAL`` the notional floor.
+    """
+    wanted = symbol.upper()
+    entry = next((item for item in payload["symbols"] if item["symbol"] == wanted), None)
+    if entry is None:
+        msg = f"{wanted} not listed in exchangeInfo"
+        raise ValueError(msg)
+    filters = {item["filterType"]: item for item in entry["filters"]}
+    price, lot = filters["PRICE_FILTER"], filters["LOT_SIZE"]
+    return InstrumentSpec(
+        exchange=EXCHANGE,
+        symbol=wanted,
+        base_asset=entry["baseAsset"],
+        quote_asset=entry["quoteAsset"],
+        tick_size=Decimal(price["tickSize"]),
+        lot_size=Decimal(lot["stepSize"]),
+        min_price=Decimal(price["minPrice"]),
+        max_price=Decimal(price["maxPrice"]),
+        min_qty=Decimal(lot["minQty"]),
+        max_qty=Decimal(lot["maxQty"]),
+        min_notional=Decimal(filters["MIN_NOTIONAL"]["notional"]),
+    )
+
+
 # --------------------------------------------------------------------------- stats
-def _percentile(samples: Sequence[int], pct: float) -> float:
-    if not samples:
-        return math.nan
-    ordered = sorted(samples)
-    rank = pct / 100.0 * (len(ordered) - 1)
-    lo = math.floor(rank)
-    hi = math.ceil(rank)
-    if lo == hi:
-        return float(ordered[lo])
-    weight = rank - lo
-    return float(ordered[lo]) * (1.0 - weight) + float(ordered[hi]) * weight
+class LatencyHistogram:
+    """Whole-session ``recv - event`` distribution in fixed memory.
+
+    1 ms buckets over +-60 s (~1 MB): percentiles are within 0.5 ms and clamped to the
+    exact min / max; count, mean, min and max are exact. Samples beyond +-60 s land in
+    the edge buckets. Replaces a cap on the first 10 000 samples, which hid a tail that
+    got worse later in the capture (QA H3).
+    """
+
+    def __init__(self) -> None:
+        n_buckets = 2 * LATENCY_RANGE_NS // LATENCY_BUCKET_NS + 1
+        self._counts: npt.NDArray[np.int64] = np.zeros(n_buckets, dtype=np.int64)
+        self.count = 0
+        self.total_ns = 0
+        self.min_ns = 0
+        self.max_ns = 0
+
+    def add(self, sample_ns: int) -> None:
+        index = (sample_ns + LATENCY_RANGE_NS) // LATENCY_BUCKET_NS
+        self._counts[min(max(index, 0), self._counts.size - 1)] += 1
+        if self.count == 0:
+            self.min_ns = self.max_ns = sample_ns
+        else:
+            self.min_ns = min(self.min_ns, sample_ns)
+            self.max_ns = max(self.max_ns, sample_ns)
+        self.count += 1
+        self.total_ns += sample_ns
+
+    def percentiles(self, pcts: Sequence[float]) -> list[float]:
+        """Bucket-centre estimate of each percentile (NaN when empty)."""
+        if self.count == 0:
+            return [math.nan for _ in pcts]
+        cumulative = np.cumsum(self._counts)
+        out: list[float] = []
+        for pct in pcts:
+            rank = pct / 100.0 * (self.count - 1)  # 0-based, as linear interpolation
+            index = int(np.searchsorted(cumulative, rank, side="right"))
+            centre = index * LATENCY_BUCKET_NS - LATENCY_RANGE_NS + LATENCY_BUCKET_NS / 2
+            out.append(float(min(max(centre, self.min_ns), self.max_ns)))
+        return out
 
 
 @dataclass
 class FeedStats:
-    """Counters and latency samples for one :class:`BinanceFuturesFeed` instance."""
+    """Counters and the latency distribution for one :class:`BinanceFuturesFeed` instance."""
 
     gaps: int = 0
     resyncs: int = 0
@@ -316,33 +383,26 @@ class FeedStats:
     rest_errors: int = 0
     stale_disconnects: int = 0
     queue_high_watermark: int = 0
-    latency_samples_ns: list[int] = field(default_factory=list)
+    latency: LatencyHistogram = field(default_factory=LatencyHistogram, repr=False)
 
     def record_latency(self, sample_ns: int) -> None:
-        """Keep a bounded list of ``ts_recv_ns - ts_event_ns`` samples."""
-        if len(self.latency_samples_ns) < MAX_LATENCY_SAMPLES:
-            self.latency_samples_ns.append(sample_ns)
+        """Add one ``ts_recv_ns - ts_event_ns`` sample to the session histogram."""
+        self.latency.add(sample_ns)
 
     def latency_summary(self) -> dict[str, float]:
         """Count / mean / p50 / p99 / min / max in nanoseconds (NaN when empty)."""
-        samples = self.latency_samples_ns
-        if not samples:
+        hist = self.latency
+        p50, p99 = hist.percentiles((50.0, 99.0))
+        if hist.count == 0:
             nan = math.nan
-            return {
-                "count": 0.0,
-                "mean": nan,
-                "p50": nan,
-                "p99": nan,
-                "min": nan,
-                "max": nan,
-            }
+            return {"count": 0.0, "mean": nan, "p50": nan, "p99": nan, "min": nan, "max": nan}
         return {
-            "count": float(len(samples)),
-            "mean": float(statistics.fmean(samples)),
-            "p50": _percentile(samples, 50.0),
-            "p99": _percentile(samples, 99.0),
-            "min": float(min(samples)),
-            "max": float(max(samples)),
+            "count": float(hist.count),
+            "mean": hist.total_ns / hist.count,
+            "p50": p50,
+            "p99": p99,
+            "min": float(hist.min_ns),
+            "max": float(hist.max_ns),
         }
 
 
@@ -496,6 +556,12 @@ class BinanceFuturesFeed:
         )
         response.raise_for_status()
         return parse_depth_snapshot(orjson.loads(response.content), self.symbol)
+
+    async def fetch_instrument_spec(self, client: httpx.AsyncClient) -> InstrumentSpec:
+        """Current tick / lot grid of :attr:`symbol`. Raises on HTTP errors."""
+        response = await client.get(EXCHANGE_INFO_PATH)
+        response.raise_for_status()
+        return parse_exchange_info(orjson.loads(response.content), self.symbol)
 
     async def start(self) -> None:
         """Run the reconnect loop in a background task, publishing to :attr:`queue`."""

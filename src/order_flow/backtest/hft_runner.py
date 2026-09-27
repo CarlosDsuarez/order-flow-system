@@ -17,12 +17,13 @@ from order_flow.backtest.hft_adapter import capture_to_hft_feed, hftbacktest_ava
 from order_flow.backtest.quotes import QuotePair, RollingOfi, aggressive_quotes, maker_quotes
 from order_flow.backtest.types import Fill, OrderSide, Position
 from order_flow.ingestion.binance_futures import EXCHANGE as DEFAULT_EXCHANGE
+from order_flow.ingestion.instruments import resolve_capture_spec
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-TICK: Final = 0.1
-LOT: Final = 0.001
+    from order_flow.ingestion.instruments import InstrumentSpec
+
 PRICE_EPS: Final = 1e-12
 QUEUE_MODEL: Final = "ProbQueueModel+PowerProbQueueFunc(n=2)"
 
@@ -36,6 +37,8 @@ class HftBacktestResult:
     capture: str
     exchange: str
     symbol: str
+    tick_size: float
+    lot_size: float
     duration_ns: int
     n_feed_events: int
     n_public_trades: int
@@ -209,6 +212,7 @@ def _requote(
     stats: _RunStats,
     rolling: RollingOfi,
     *,
+    tick: float,
     spread_ticks: int,
     ofi_threshold: float,
     max_skew: int,
@@ -237,7 +241,7 @@ def _requote(
     else:
         quotes = maker_quotes(
             mid=mid,
-            tick=TICK,
+            tick=tick,
             spread_ticks=spread_ticks,
             ofi=ofi,
             threshold=ofi_threshold,
@@ -279,11 +283,15 @@ def run_ofi_mm_hftbacktest(
     spread_ticks: int = 2,
     ofi_threshold: float = 5.0,
     ofi_window_ns: int = 1_000_000_000,
-    trade_size: float = 0.001,
+    trade_size: float | None = None,
     max_skew: int = 1,
     cross_spread: bool = False,
+    spec: InstrumentSpec | None = None,
 ) -> HftBacktestResult:
     """Load ``root``, run one HashMapMarketDepthBacktest, return counters.
+
+    Tick / lot come from ``spec`` or the capture's ``instrument.json`` (legacy BTCUSDT
+    captures fall back to 0.1 / 0.001); ``trade_size`` defaults to the venue minimum.
 
     Order latency is 0 ns (same as nautilus 1.231 with no ``latency_model``).
     Feed ``local_ts`` is forced strictly after ``exch_ts`` so the engine is valid
@@ -304,7 +312,9 @@ def run_ofi_mm_hftbacktest(
     from hftbacktest.order import CANCELED, EXPIRED, FILLED, NEW, PARTIALLY_FILLED, REJECTED
     from hftbacktest.types import event_dtype
 
-    feed = capture_to_hft_feed(root, exchange=exchange, symbol=symbol.upper())
+    spec = spec if spec is not None else resolve_capture_spec(root, symbol)
+    size = float(spec.min_qty) if trade_size is None else trade_size
+    feed = capture_to_hft_feed(root, exchange=exchange, symbol=spec.symbol)
     if feed.conservation_gap() != 0:
         msg = f"hft adapter conservation gap {feed.conservation_gap()} on {root}"
         raise RuntimeError(msg)
@@ -329,11 +339,11 @@ def run_ofi_mm_hftbacktest(
         .power_prob_queue_model(2.0)
         .no_partial_fill_exchange()
         .trading_value_fee_model(maker_fee, taker_fee)
-        .tick_size(TICK)
-        .lot_size(LOT)
+        .tick_size(spec.tick)
+        .lot_size(spec.lot)
     )
     hbt = HashMapMarketDepthBacktest([asset])
-    stats = _RunStats(symbol=symbol.upper())
+    stats = _RunStats(symbol=spec.symbol)
     rolling = RollingOfi(window_ns=ofi_window_ns)
     tif = GTC if cross_spread else GTX
     statuses = {
@@ -368,10 +378,11 @@ def run_ofi_mm_hftbacktest(
                 hbt,
                 stats,
                 rolling,
+                tick=spec.tick,
                 spread_ticks=spread_ticks,
                 ofi_threshold=ofi_threshold,
                 max_skew=max_skew,
-                trade_size=trade_size,
+                trade_size=size,
                 cross_spread=cross_spread,
                 tif=int(tif),
                 limit=int(LIMIT),
@@ -403,7 +414,9 @@ def run_ofi_mm_hftbacktest(
             queue_model=QUEUE_MODEL,
             capture=str(root),
             exchange=exchange,
-            symbol=symbol.upper(),
+            symbol=spec.symbol,
+            tick_size=spec.tick,
+            lot_size=spec.lot,
             duration_ns=max(0, duration),
             n_feed_events=int(data.size),
             n_public_trades=feed.n_feed_trade_events,
@@ -417,7 +430,7 @@ def run_ofi_mm_hftbacktest(
             spread_ticks=spread_ticks,
             ofi_threshold=ofi_threshold,
             ofi_window_ns=ofi_window_ns,
-            trade_size=trade_size,
+            trade_size=size,
             max_skew=max_skew,
             cross_spread=cross_spread,
             realized_pnl=realized,

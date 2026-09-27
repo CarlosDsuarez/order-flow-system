@@ -67,6 +67,41 @@ correlacionan con `delta_ids` grande (overshoot de batch gordo, hasta 20517
 IDs en un batch de 100 ms): el tramo intra-batch final es el límite
 metodológico actual. Veredicto H4 sigue abierto/FAIL; umbrales intactos.
 
+### Addendum 2026-09-26 — H2 y H3 corregidos; validación de integridad
+
+**H2 (corregido).** La causa no era el docstring sino el orden: `capture_to_ops`
+ordenaba `(ts, snap antes que delta, u)`. El snapshot periódico hereda `ts` y `u` del
+delta recién aplicado, así que iba **antes** que ese delta y nunca coincidía con
+`last_id`: CLEAR+ADD en cada intervalo. Ahora usa el orden de `reconstruct`
+(`ts`, `u`, delta antes que snapshot). Re-corrida en `data/qa-audit-15min`, nautilus
+1.231, misma economía:
+
+| | antes | después |
+| --- | ---: | ---: |
+| Book batches (CLEAR) | 9686 (885) | 8802 (1) |
+| Maker fills / fill rate | 345 / 26.38 % | 312 / **24.55 %** |
+| Maker PnL USDT | −8.26 | −8.18 |
+| Crossing fees USDT | ~599 | 544 |
+
+Cada CLEAR reseteaba la cola estimada de nautilus: el fill rate maker estaba inflado
+~1.8 pp. Frente a hftbacktest (27.72 %) la brecha pasa de +1.3 a +3.2 pp: nautilus era
+**más** conservador de lo que decía la tabla. La conclusión (PnL maker negativo, NO-GO)
+no cambia. Las tablas de `docs/backtest/` son anteriores a este fix.
+
+**H3 (corregido).** `FeedStats` guardaba solo las primeras 10 000 muestras. Ahora usa un
+histograma de sesión completa (buckets de 1 ms en ±60 s, ~1 MB fijo): count, media,
+min y max exactos; percentiles a ±0.5 ms.
+
+**Integridad.** `scripts/validate_capture.py` (`order_flow.storage.quality`) recorre la
+cadena de deltas por update id y cuenta roturas no explicadas por un resync, snapshots
+cruzados, `trade_id` duplicados y precios fuera de la rejilla de `instrument.json`.
+Todas las capturas BTCUSDT de `data/` dan **OK** (0 roturas; `live-btcusdt-45min`
+2 épocas, `mi-captura` 9). Ordenar por `ts` daba un falso positivo en la de 45 min: el
+`E` de un snapshot REST es la hora de respuesta y puede ser posterior al del diff que
+bracket-ea su `lastUpdateId`. Los replays (`reconstruct`, adapters) siguen ordenando por
+`ts`: en cada resync pierden o aplican fuera de orden ese único diff hasta el siguiente
+snapshot. **Abierto**, impacto acotado a un evento por resync.
+
 ## Fase A — Higiene
 
 ### Pytest (default, sin `RUN_INTEGRATION`)

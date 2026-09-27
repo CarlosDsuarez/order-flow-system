@@ -13,23 +13,22 @@ from typing import TYPE_CHECKING, Any
 
 from order_flow.backtest.conversion import capture_to_ops
 from order_flow.backtest.nautilus_factory import (
-    INSTRUMENT_ID,
-    PRICE_PRECISION,
-    SIZE_PRECISION,
-    TICK_SIZE,
-    btcusdt_perp,
+    instrument_id_for,
+    perpetual,
     to_order_book_deltas,
     to_trade_tick,
 )
 from order_flow.backtest.ofi_mm import OfiMmStats, load_ofi_mm
 from order_flow.ingestion.binance_futures import EXCHANGE as DEFAULT_EXCHANGE
+from order_flow.ingestion.instruments import resolve_capture_spec
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from order_flow.ingestion.instruments import InstrumentSpec
+
 STARTING_USDT = 100_000.0
 DEFAULT_LEVERAGE = Decimal("1")
-TICK = float(TICK_SIZE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +40,8 @@ class BacktestResult:
     exchange: str
     symbol: str
     instrument_id: str
+    tick_size: float
+    lot_size: float
     duration_ns: int
     n_book_batches: int
     n_public_trades: int
@@ -87,32 +88,16 @@ def _sum_commissions(account: Any) -> float:
 
 def materialize_capture(
     root: Path,
-    instrument_id: Any,
+    nautilus_id: Any,
     *,
     exchange: str,
-    symbol: str,
-    tick: float = TICK,
+    spec: InstrumentSpec,
 ) -> tuple[list[Any], list[Any]]:
     """Convert a hive capture into nautilus ``OrderBookDeltas`` + ``TradeTick`` lists."""
-    batches, trades = capture_to_ops(root, exchange=exchange, symbol=symbol, tick=tick)
-    books = [
-        to_order_book_deltas(
-            ops,
-            instrument_id,
-            price_precision=PRICE_PRECISION,
-            size_precision=SIZE_PRECISION,
-        )
-        for ops in batches
-    ]
-    ticks = [
-        to_trade_tick(
-            trade,
-            instrument_id,
-            price_precision=PRICE_PRECISION,
-            size_precision=SIZE_PRECISION,
-        )
-        for trade in trades
-    ]
+    batches, trades = capture_to_ops(root, exchange=exchange, symbol=spec.symbol, tick=spec.tick)
+    precision = {"price_precision": spec.price_precision, "size_precision": spec.size_precision}
+    books = [to_order_book_deltas(ops, nautilus_id, **precision) for ops in batches]
+    ticks = [to_trade_tick(trade, nautilus_id, **precision) for trade in trades]
     return books, ticks
 
 
@@ -126,13 +111,18 @@ def run_ofi_mm_backtest(
     spread_ticks: int = 2,
     ofi_threshold: float = 5.0,
     ofi_window_ns: int = 1_000_000_000,
-    trade_size: float = 0.001,
+    trade_size: float | None = None,
     max_skew: int = 1,
     cross_spread: bool = False,
     starting_usdt: float = STARTING_USDT,
     leverage: Decimal = DEFAULT_LEVERAGE,
+    spec: InstrumentSpec | None = None,
 ) -> BacktestResult:
     """Load ``root``, run one engine, dispose it, return counters.
+
+    The grid comes from ``spec`` or the capture's ``instrument.json`` (legacy BTCUSDT
+    captures fall back to the old tick 0.1 / lot 0.001). ``trade_size`` defaults to the
+    venue minimum quantity. ``ofi_threshold`` is in base units: retune it per symbol.
 
     Venue is L2_MBP with ``trade_execution``, ``queue_position`` and
     ``liquidity_consumption`` on. No ``latency_model``. Risk engine is bypassed
@@ -148,10 +138,12 @@ def run_ofi_mm_backtest(
     from nautilus_trader.model.objects import Money
     from nautilus_trader.risk.config import RiskEngineConfig
 
-    instrument = btcusdt_perp(maker_fee=Decimal(str(maker_fee)), taker_fee=Decimal(str(taker_fee)))
-    books, ticks = materialize_capture(
-        root, instrument.id, exchange=exchange, symbol=symbol.upper()
+    spec = spec if spec is not None else resolve_capture_spec(root, symbol)
+    size = float(spec.min_qty) if trade_size is None else trade_size
+    instrument = perpetual(
+        spec, maker_fee=Decimal(str(maker_fee)), taker_fee=Decimal(str(taker_fee))
     )
+    books, ticks = materialize_capture(root, instrument.id, exchange=exchange, spec=spec)
     if not books:
         msg = f"no book data in {root}"
         raise ValueError(msg)
@@ -177,12 +169,12 @@ def run_ofi_mm_backtest(
     strategy = ofi_strategy_cls(
         ofi_config_cls(
             instrument_id=instrument.id,
-            trade_size=trade_size,
+            trade_size=size,
             spread_ticks=spread_ticks,
             ofi_threshold=ofi_threshold,
             ofi_window_ns=ofi_window_ns,
             max_skew=max_skew,
-            tick=TICK,
+            tick=spec.tick,
             cross_spread=cross_spread,
         )
     )
@@ -222,8 +214,10 @@ def run_ofi_mm_backtest(
             nautilus_version=str(nautilus_trader.__version__),
             capture=str(root),
             exchange=exchange,
-            symbol=symbol.upper(),
-            instrument_id=INSTRUMENT_ID,
+            symbol=spec.symbol,
+            instrument_id=instrument_id_for(spec),
+            tick_size=spec.tick,
+            lot_size=spec.lot,
             duration_ns=max(0, ts_last - ts_first),
             n_book_batches=len(books),
             n_public_trades=len(ticks),
@@ -232,7 +226,7 @@ def run_ofi_mm_backtest(
             spread_ticks=spread_ticks,
             ofi_threshold=ofi_threshold,
             ofi_window_ns=ofi_window_ns,
-            trade_size=trade_size,
+            trade_size=size,
             max_skew=max_skew,
             cross_spread=cross_spread,
             starting_balance=starting_usdt,

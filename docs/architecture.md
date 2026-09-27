@@ -20,6 +20,7 @@ ingestion  →  orderbook + asyncio.Queue  →  storage (Parquet, opcional)
 | 4. Backtest | `order_flow.backtest` | Tipos `Order`, `Fill`, `Position`, protocolo `Strategy`. Adaptador `nautilus_trader` 1.231.0 (extra `backtest`): Parquet L2 → `OrderBookDeltas` + `TradeTick`. Segundo adaptador `hftbacktest` 2.4.4 (extra `hftbacktest`): Parquet → NumPy `event_dtype` → `ProbQueueModel` + `PowerProbQueueFunc(n=2)`. Misma economía OFI-MM; **no** hay ejecución live. [backtest_limitations.md](backtest_limitations.md), [backtest/hftbacktest_queue.md](backtest/hftbacktest_queue.md). |
 
 Detalle del conector L2: [ingestion/binance-futures-l2.md](ingestion/binance-futures-l2.md).
+Captura de días (launchd, una carpeta por corrida): [storage/continuous-capture.md](storage/continuous-capture.md).
 Libro: [orderbook/data-structure.md](orderbook/data-structure.md).
 Parquet: [storage/parquet.md](storage/parquet.md).
 

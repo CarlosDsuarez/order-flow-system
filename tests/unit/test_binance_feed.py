@@ -496,6 +496,31 @@ def test_latency_summary_empty_and_populated() -> None:
     assert summary["max"] == pytest.approx(30.0)
 
 
+def test_latency_summary_covers_the_whole_session() -> None:
+    # QA H3: only the first 10 000 samples were kept, so a capture whose tail got worse
+    # later reported p99 = +63 ms in capture_meta.json against +153 ms over all events.
+    stats = BinanceFuturesFeed("BTCUSDT").stats
+    for _ in range(10_000):
+        stats.record_latency(1_000_000)  # 1 ms early in the session
+    for _ in range(10_000):
+        stats.record_latency(500_000_000)  # 500 ms later on
+    summary = stats.latency_summary()
+    assert summary["count"] == 20_000.0
+    assert summary["p99"] == pytest.approx(500_000_000, abs=1_000_000)
+    assert summary["mean"] == pytest.approx(250_500_000)
+    assert summary["max"] == 500_000_000.0
+
+
+def test_latency_summary_keeps_negative_skewed_samples() -> None:
+    # Raw recv - event is often negative (local clock behind Binance by ~200 ms).
+    stats = BinanceFuturesFeed("BTCUSDT").stats
+    for sample in (-300_000_000, -200_000_000, -100_000_000):
+        stats.record_latency(sample)
+    summary = stats.latency_summary()
+    assert summary["min"] == -300_000_000.0
+    assert summary["p50"] == pytest.approx(-200_000_000, abs=1_000_000)
+
+
 def test_feed_marks_book_unsynced_on_gap() -> None:
     feed = BinanceFuturesFeed("BTCUSDT")
     feed.book.apply_snapshot(

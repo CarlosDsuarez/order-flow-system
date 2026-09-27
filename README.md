@@ -74,6 +74,7 @@ uv run pytest                             # tests + cobertura (umbral 80 %)
 uv run pre-commit install                 # hooks de calidad en cada commit
 uv run python scripts/record_l2.py --help # grabar L2 + trades a Parquet (default 300 s)
 uv run python scripts/capture_report.py --help  # tasas, tamaños, huecos de una captura
+uv run python scripts/validate_capture.py --help # integridad: cadena pu, grid, duplicados
 uv run python scripts/validate_live_l2.py --help  # 60s de honestidad L2, sin Parquet
 uv sync --extra backtest                          # instala nautilus_trader 1.231.0
 uv run python scripts/run_ofi_mm_backtest.py --help  # MM sesgado por OFI (no es un edge)

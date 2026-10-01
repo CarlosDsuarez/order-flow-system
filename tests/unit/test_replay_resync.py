@@ -23,7 +23,8 @@ from order_flow.backtest.hft_adapter import (
     capture_to_hft_feed,
 )
 from order_flow.orderbook.book import OrderBook
-from order_flow.storage.parquet import ParquetWriter
+from order_flow.storage import reconstruct
+from order_flow.storage.parquet import ParquetWriter, snapshots_from_frame
 from order_flow.storage.reconstruct import iter_l1_ticks
 from tests.helpers import EXCHANGE, SYMBOL, T0_NS, make_delta, make_snapshot
 
@@ -31,9 +32,10 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import numpy.typing as npt
+    import polars as pl
 
     from order_flow.backtest.conversion import ConvertedDelta
-    from order_flow.ingestion.events import MarketEvent
+    from order_flow.ingestion.events import BookSnapshot, MarketEvent
 
 NS = 1_000_000
 Book = tuple[dict[float, float], dict[float, float]]
@@ -159,3 +161,22 @@ def test_rest_snapshot_is_applied_before_its_same_u_diff_to_keep_deep_levels(
     feed = capture_to_hft_feed(tmp_path, exchange=EXCHANGE, symbol=SYMBOL)
     assert replay_hft(feed.initial_snapshot, feed.data) == expected
     assert feed.conservation_gap() == 0
+
+
+def test_replays_only_materialize_the_snapshots_they_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Periodic snapshots are ~1 per 10 s with thousands of levels each; building every
+    # one as Python objects to skip nearly all of them made a week of data unreadable.
+    write_resync_capture(tmp_path, rest_u=300)
+    built: list[int] = []
+    real = snapshots_from_frame
+
+    def counting(frame: pl.DataFrame) -> list[BookSnapshot]:
+        built.append(frame.height)
+        return real(frame)
+
+    monkeypatch.setattr(reconstruct, "snapshots_from_frame", counting)
+    ticks = iter_l1_ticks(tmp_path, exchange=EXCHANGE, symbol=SYMBOL)
+    assert (ticks[-1].bid_qty, ticks[-1].ask_px) == (2.0, 100.6)
+    assert sum(built) == 2  # first REST + resync REST; both periodic copies never built

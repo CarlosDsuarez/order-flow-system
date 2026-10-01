@@ -396,6 +396,44 @@ def _next_part_index(directory: Path) -> int:
 
 
 # --------------------------------------------------------------------------- reader
+def capture_dirs(root: Path) -> list[Path]:
+    """Capture directories under ``root``: itself if it holds one, else its runs, sorted.
+
+    ``scripts/capture_loop.sh`` writes one directory per run (``BASE/SYMBOL/<UTC start>/``).
+    Pointing any reader at ``BASE/SYMBOL`` reads every run as one tape: runs join like
+    resyncs (each starts from a REST snapshot; update ids keep growing across sessions).
+    """
+    root = Path(root)
+
+    def holds_capture(path: Path) -> bool:
+        return any((path / kind).is_dir() for kind in PARTITION_DIR.values())
+
+    if holds_capture(root) or not root.is_dir():
+        return [root]
+    return sorted(path for path in root.iterdir() if path.is_dir() and holds_capture(path))
+
+
+def part_files(
+    root: Path,
+    event_type: EventType,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    date: str | None = None,
+) -> list[Path]:
+    """Every ``part-*.parquet`` of ``event_type`` under ``root`` (all runs), sorted."""
+    pattern = "/".join(
+        (
+            PARTITION_DIR[event_type],
+            f"exchange={exchange or '*'}",
+            f"symbol={symbol or '*'}",
+            f"date={date or '*'}",
+            "*.parquet",
+        )
+    )
+    return sorted(path for run in capture_dirs(root) for path in run.glob(pattern))
+
+
 def scan_events(
     root: Path,
     event_type: EventType,
@@ -408,16 +446,7 @@ def scan_events(
 
     Returns an empty frame with the right schema when nothing matches.
     """
-    pattern = "/".join(
-        (
-            PARTITION_DIR[event_type],
-            f"exchange={exchange or '*'}",
-            f"symbol={symbol or '*'}",
-            f"date={date or '*'}",
-            "*.parquet",
-        )
-    )
-    files = sorted(Path(root).glob(pattern))
+    files = part_files(root, event_type, exchange=exchange, symbol=symbol, date=date)
     if not files:
         return pl.DataFrame(schema=SCHEMAS[event_type]).lazy()
     return pl.scan_parquet(files)

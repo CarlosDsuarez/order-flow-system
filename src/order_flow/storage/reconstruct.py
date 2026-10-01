@@ -19,7 +19,7 @@ from order_flow.orderbook.errors import SequenceGapError
 from order_flow.storage.parquet import deltas_from_frame, read_events, snapshots_from_frame
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     import numpy.typing as npt
@@ -38,11 +38,21 @@ class BookStream:
     n_off_chain_deltas: int
 
 
-def _uid(event: BookSnapshot | BookDelta) -> int:
-    return event.last_update_id if isinstance(event, BookSnapshot) else event.final_update_id
+@dataclass(frozen=True, slots=True)
+class _SnapshotRef:
+    """What ordering needs from a snapshot; its levels are built only if it is kept."""
+
+    last_update_id: int
+    ts_event_ns: int
+    ts_recv_ns: int
+    row: int
 
 
-def _restamp(events: list[BookSnapshot | BookDelta]) -> list[BookSnapshot | BookDelta]:
+def _uid(event: _SnapshotRef | BookDelta) -> int:
+    return event.final_update_id if isinstance(event, BookDelta) else event.last_update_id
+
+
+def _restamp(events: list[_SnapshotRef | BookDelta]) -> list[_SnapshotRef | BookDelta]:
     """Pull timestamps back so both clocks strictly increase along the replay order.
 
     The engines re-sort by time. A REST snapshot's ``E`` / receive time is the response,
@@ -64,21 +74,14 @@ def _restamp(events: list[BookSnapshot | BookDelta]) -> list[BookSnapshot | Book
     return out
 
 
-def book_stream(snapshots: list[BookSnapshot], deltas: list[BookDelta]) -> BookStream:
-    """Order snapshots and deltas for replay, across resyncs, without stale state.
-
-    Walks update ids, not event time: a REST snapshot's ``E`` can be later than the
-    diff that brackets it. At equal ids a delta that continues the chain goes first
-    and the snapshot is a periodic copy of that book (skipped); a delta that does not
-    continue it follows a REST resync snapshot, which goes first (the diff may carry
-    levels deeper than the REST depth). After a delta that breaks the chain, deltas
-    are dropped until the next snapshot. Timestamps are then made monotonic
-    (:func:`_restamp`).
-    """
-    ordered: list[BookSnapshot | BookDelta] = sorted(
-        [*deltas, *snapshots], key=lambda e: (_uid(e), isinstance(e, BookSnapshot))
+def _select(
+    refs: list[_SnapshotRef], deltas: list[BookDelta]
+) -> tuple[list[_SnapshotRef | BookDelta], int, int]:
+    """Replay order across resyncs; see :func:`book_stream`."""
+    ordered: list[_SnapshotRef | BookDelta] = sorted(
+        [*deltas, *refs], key=lambda e: (_uid(e), not isinstance(e, BookDelta))
     )
-    kept: list[BookSnapshot | BookDelta] = []
+    kept: list[_SnapshotRef | BookDelta] = []
     periodic = off_chain = 0
     last_u: int | None = None
     bracketing = False
@@ -86,7 +89,7 @@ def book_stream(snapshots: list[BookSnapshot], deltas: list[BookDelta]) -> BookS
     while index < len(ordered):
         event = ordered[index]
         index += 1
-        if isinstance(event, BookSnapshot):
+        if not isinstance(event, BookDelta):
             if event.last_update_id == last_u:
                 periodic += 1
                 continue
@@ -101,7 +104,7 @@ def book_stream(snapshots: list[BookSnapshot], deltas: list[BookDelta]) -> BookS
         )
         if not continues:
             upcoming = ordered[index] if index < len(ordered) else None
-            if isinstance(upcoming, BookSnapshot) and upcoming.last_update_id == _uid(event):
+            if isinstance(upcoming, _SnapshotRef) and upcoming.last_update_id == _uid(event):
                 ordered[index - 1], ordered[index] = upcoming, event  # REST first, then diff
                 index -= 1
                 continue
@@ -111,9 +114,62 @@ def book_stream(snapshots: list[BookSnapshot], deltas: list[BookDelta]) -> BookS
             continue
         kept.append(event)
         last_u, bracketing = event.final_update_id, False
+    return _restamp(kept), periodic, off_chain
+
+
+def _stream(
+    refs: list[_SnapshotRef],
+    deltas: list[BookDelta],
+    build: Callable[[list[int]], list[BookSnapshot]],
+) -> BookStream:
+    kept, periodic, off_chain = _select(refs, deltas)
+    snapshot_refs = [event for event in kept if isinstance(event, _SnapshotRef)]
+    built = iter(build([ref.row for ref in snapshot_refs]))
+    events: list[BookSnapshot | BookDelta] = []
+    for event in kept:
+        if isinstance(event, BookDelta):
+            events.append(event)
+            continue
+        snapshot = next(built)
+        events.append(replace(snapshot, ts_event_ns=event.ts_event_ns, ts_recv_ns=event.ts_recv_ns))
     return BookStream(
-        events=tuple(_restamp(kept)), n_periodic_skipped=periodic, n_off_chain_deltas=off_chain
+        events=tuple(events), n_periodic_skipped=periodic, n_off_chain_deltas=off_chain
     )
+
+
+def book_stream(snapshots: list[BookSnapshot], deltas: list[BookDelta]) -> BookStream:
+    """Order snapshots and deltas for replay, across resyncs, without stale state.
+
+    Walks update ids, not event time: a REST snapshot's ``E`` can be later than the
+    diff that brackets it. At equal ids a delta that continues the chain goes first
+    and the snapshot is a periodic copy of that book (skipped); a delta that does not
+    continue it follows a REST resync snapshot, which goes first (the diff may carry
+    levels deeper than the REST depth). After a delta that breaks the chain, deltas
+    are dropped until the next snapshot. Timestamps are then made monotonic
+    (:func:`_restamp`).
+    """
+    refs = [
+        _SnapshotRef(snap.last_update_id, snap.ts_event_ns, snap.ts_recv_ns, row)
+        for row, snap in enumerate(snapshots)
+    ]
+    return _stream(refs, deltas, lambda rows: [snapshots[row] for row in rows])
+
+
+def book_stream_from_capture(root: Path, *, exchange: str, symbol: str) -> BookStream:
+    """:func:`book_stream` over a capture, building only the snapshots it applies.
+
+    Periodic snapshots (thousands of levels, one every few seconds) are almost all
+    skipped; materializing them first made multi-day captures slow and memory-bound.
+    """
+    frame = read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)
+    refs = [
+        _SnapshotRef(int(uid), int(ts_event), int(ts_recv), row)
+        for row, (uid, ts_event, ts_recv) in enumerate(
+            zip(frame["last_update_id"], frame["ts_event_ns"], frame["ts_recv_ns"], strict=True)
+        )
+    ]
+    deltas = deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol))
+    return _stream(refs, deltas, lambda rows: snapshots_from_frame(frame[rows]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,10 +314,7 @@ def _iter_synced_books(
     root: Path, *, exchange: str, symbol: str
 ) -> Iterator[tuple[OrderBook, int, bool]]:
     """Yield ``(book, epoch, new_epoch)`` after each replayed snapshot/delta with valid L1."""
-    stream = book_stream(
-        snapshots_from_frame(read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)),
-        deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol)),
-    )
+    stream = book_stream_from_capture(root, exchange=exchange, symbol=symbol)
     book = OrderBook()
     epoch = 0
     yielded = False

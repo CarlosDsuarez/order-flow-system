@@ -30,12 +30,10 @@ import numpy as np
 
 from order_flow.ingestion.events import BookDelta, BookSnapshot, PriceLevel, Side, Trade
 from order_flow.storage.parquet import (
-    deltas_from_frame,
     read_events,
-    snapshots_from_frame,
     trades_from_frame,
 )
-from order_flow.storage.reconstruct import book_stream
+from order_flow.storage.reconstruct import book_stream_from_capture
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -351,16 +349,17 @@ def capture_to_hft_feed(
     snapshots of an intact chain are skipped so the queue model is not reset every
     second; a snapshot after a chain break is a resync. Qty-0 trades are dropped.
     """
-    snapshots = snapshots_from_frame(
-        read_events(root, "book_snapshot", exchange=exchange, symbol=symbol)
-    )
-    deltas = deltas_from_frame(read_events(root, "book_delta", exchange=exchange, symbol=symbol))
+    stream = book_stream_from_capture(root, exchange=exchange, symbol=symbol)
     trades = trades_from_frame(read_events(root, "trade", exchange=exchange, symbol=symbol))
-    if not snapshots:
+    n_snapshots_in = stream.n_periodic_skipped + sum(
+        isinstance(event, BookSnapshot) for event in stream.events
+    )
+    if n_snapshots_in == 0:
         msg = "capture has no book snapshots; hftbacktest needs an initial snapshot"
         raise ValueError(msg)
-
-    stream = book_stream(snapshots, deltas)
+    n_deltas_in = stream.n_off_chain_deltas + sum(
+        isinstance(event, BookDelta) for event in stream.events
+    )
     acc = _BookAcc(initial_rows=[], feed_rows=[], last_id=None, n_skipped=stream.n_periodic_skipped)
     for event in stream.events:
         if isinstance(event, BookSnapshot):
@@ -376,8 +375,8 @@ def capture_to_hft_feed(
     return HftFeed(
         initial_snapshot=_to_array(acc.initial_rows),
         data=data,
-        n_snapshots_in=len(snapshots),
-        n_deltas_in=len(deltas),
+        n_snapshots_in=n_snapshots_in,
+        n_deltas_in=n_deltas_in,
         n_trades_in=len(trades),
         n_initial_snapshots=acc.n_initial,
         n_snapshots_skipped=acc.n_skipped,

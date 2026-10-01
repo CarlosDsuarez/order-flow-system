@@ -18,6 +18,8 @@ ENV/
 # --- Data -----------------------------------------------------------------
 data/
 *.parquet
+# Small real tapes committed on purpose as regression fixtures (tests/fixtures/README.md).
+!tests/fixtures/**/*.parquet
 
 # --- Tooling caches -------------------------------------------------------
 .pytest_cache/
